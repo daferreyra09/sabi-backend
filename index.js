@@ -39,7 +39,7 @@ app.get('/chat/:mensaje', async (req, res) => {
   const mensaje = req.params.mensaje;
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 500,
       system: SABI_SYSTEM,
       messages: [{ role: 'user', content: mensaje }],
@@ -66,7 +66,7 @@ app.post('/mensaje', async (req, res) => {
       content: mensaje
     });
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 500,
       system: SABI_SYSTEM,
       messages: messages,
