@@ -1,13 +1,13 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const SABI_SYSTEM = `Sos Sabi, un acompañante personal de salud basado en neurociencia y evidencia científica.
 No sos un médico, no sos un coach, no sos un nutricionista. Sos ese amigo que más sabe — el que tiene memoria de la persona, la acompaña sin juzgar, y le muestra lo que no está viendo solo.
@@ -29,56 +29,72 @@ Lo que nunca hacés:
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
-// Ruta de estado
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.0.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.1.0' });
 });
 
 // Ruta de prueba desde el navegador
-app.get('/chat/:mensaje', async (req, res) => {
-  const mensaje = req.params.mensaje;
+app.get('/chat/:usuario/:mensaje', async (req, res) => {
+  const { usuario, mensaje } = req.params;
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 500,
-      system: SABI_SYSTEM,
-      messages: [{ role: 'user', content: mensaje }],
-    });
-    res.json({ respuesta: response.content[0].text });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+    // Buscar o crear usuario
+    let { data: user } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('telefono', usuario)
+      .single();
 
-// Ruta principal POST
-app.post('/mensaje', async (req, res) => {
-  const { mensaje, contexto } = req.body;
-  if (!mensaje) {
-    return res.status(400).json({ error: 'Falta el mensaje' });
-  }
-  try {
-    const messages = [];
-    if (contexto && Array.isArray(contexto)) {
-      messages.push(...contexto);
+    if (!user) {
+      const { data: newUser } = await supabase
+        .from('usuarios')
+        .insert([{ telefono: usuario, nombre: usuario }])
+        .select()
+        .single();
+      user = newUser;
     }
-    messages.push({
-      role: 'user',
-      content: mensaje
-    });
+
+    // Traer historial reciente
+    const { data: historial } = await supabase
+      .from('conversaciones')
+      .select('rol, mensaje')
+      .eq('usuario_id', user.id)
+      .order('fecha', { ascending: false })
+      .limit(10);
+
+    const mensajesPrevios = (historial || [])
+      .reverse()
+      .map(h => ({ role: h.rol, content: h.mensaje }));
+
+    mensajesPrevios.push({ role: 'user', content: mensaje });
+
+    // Guardar mensaje del usuario
+    await supabase.from('conversaciones').insert([{
+      usuario_id: user.id,
+      rol: 'user',
+      mensaje: mensaje
+    }]);
+
+    // Respuesta de Sabi
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
       system: SABI_SYSTEM,
-      messages: messages,
+      messages: mensajesPrevios,
     });
-    const respuestaSabi = response.content[0].text;
-    res.json({
-      respuesta: respuestaSabi,
-      mensaje_enviado: mensaje
-    });
+
+    const respuesta = response.content[0].text;
+
+    // Guardar respuesta de Sabi
+    await supabase.from('conversaciones').insert([{
+      usuario_id: user.id,
+      rol: 'assistant',
+      mensaje: respuesta
+    }]);
+
+    res.json({ respuesta, usuario: user.nombre });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Algo salió mal', detalle: error.message });
+    console.error(error);
+    res.status(500).json({ error: error.message });
   }
 });
 
