@@ -30,7 +30,7 @@ Lo que nunca hacés:
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.3.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.4.0' });
 });
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
@@ -60,7 +60,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .order('fecha', { ascending: false })
       .limit(10);
 
-    // Traer eventos proximos (proximos 365 dias)
+    // Traer eventos proximos (365 dias)
     const hoy = new Date();
     const en365dias = new Date();
     en365dias.setDate(hoy.getDate() + 365);
@@ -73,19 +73,24 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .gte('fecha_evento', hoy.toISOString())
       .lte('fecha_evento', en365dias.toISOString());
 
-    // Construir contexto de eventos
-    let contextoEventos = '';
+    // Construir system prompt personalizado
+    let systemPersonalizado = SABI_SYSTEM;
+
+    // Agregar perfil del usuario si existe
+    if (user.contexto_base) {
+      systemPersonalizado += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
+    }
+
+    // Agregar eventos proximos
     if (eventosProximos && eventosProximos.length > 0) {
-      contextoEventos = '\n\nEVENTOS PROXIMOS DEL USUARIO:\n';
+      systemPersonalizado += '\n\nEVENTOS PROXIMOS:\n';
       eventosProximos.forEach(e => {
         const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
         const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
-        contextoEventos += `- ${e.titulo}: ${fecha} (en ${diasRestantes} dias) — ${e.descripcion}\n`;
+        systemPersonalizado += `- ${e.titulo}: ${fecha} (en ${diasRestantes} dias) — ${e.descripcion}\n`;
       });
-      contextoEventos += '\nSi es relevante para la conversacion, menciona estos eventos de forma natural y sin alarmar.';
+      systemPersonalizado += 'Menciona estos eventos solo cuando sea relevante, de forma natural.';
     }
-
-    const systemConContexto = SABI_SYSTEM + contextoEventos;
 
     const mensajesPrevios = (historial || [])
       .reverse()
@@ -104,7 +109,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
-      system: systemConContexto,
+      system: systemPersonalizado,
       messages: mensajesPrevios,
     });
 
@@ -119,12 +124,72 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     res.json({ 
       respuesta, 
-      usuario: user.nombre,
-      eventos_proximos: eventosProximos?.length || 0
+      usuario: user.nombre
     });
 
   } catch (error) {
     console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check-in de cierre del dia
+app.get('/checkin/:usuario', async (req, res) => {
+  const { usuario } = req.params;
+  try {
+    let { data: user } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('telefono', usuario)
+      .single();
+
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const checkin = {
+      mensaje: `Cerramos el día, ${user.nombre}. Cinco cositas rápidas 👇`,
+      preguntas: [
+        {
+          id: 1,
+          pregunta: '¿Cómo estuvo tu energía hoy?',
+          opciones: ['🔋🔋🔋 Alta', '🔋🔋 Normal', '🔋 Baja', '🪫 Sin nada'],
+          pilar: 'foco_energia'
+        },
+        {
+          id: 2,
+          pregunta: '¿Cómo te sentiste por dentro?',
+          opciones: ['😊 Bien', '😐 Regular', '😔 Pesado', '🌀 Ansioso'],
+          pilar: 'estres_recuperacion'
+        },
+        {
+          id: 3,
+          pregunta: '¿Estuviste con gente que te hace bien?',
+          opciones: ['❤️ Sí, estuvo bueno', '👋 Algo, poco', '🏠 Solo todo el día'],
+          pilar: 'contexto_vida'
+        },
+        {
+          id: 4,
+          pregunta: '¿Ya estás soltando el día?',
+          opciones: ['✅ Sí, desconectando', '⏳ Más o menos', '❌ Todavía en modo trabajo'],
+          pilar: 'estres_recuperacion'
+        },
+        {
+          id: 5,
+          pregunta: '¿Cómo estuvo el cuerpo hoy?',
+          opciones: ['💪 Liviano y bien', '😐 Normal', '🪨 Pesado o cansado', '🤕 Algo molesto'],
+          pilar: 'movimiento'
+        },
+        {
+          id: 6,
+          pregunta: '¿Algo que quieras dejarme anotado del día?',
+          opciones: ['✍️ Sí, te cuento', '👌 No, ya está'],
+          pilar: 'contexto_vida',
+          opcional: true
+        }
+      ]
+    };
+
+    res.json(checkin);
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
