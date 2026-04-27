@@ -76,7 +76,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
     // Construir contexto de eventos
     let contextoEventos = '';
     if (eventosProximos && eventosProximos.length > 0) {
-      contextoEventos = '\n\nEVENTOS PRÓXIMOS DEL USUARIO (próximos 60 días):\n';
+      contextoEventos = '\n\nEVENTOS PRÓXIMOS DEL USUARIO (próximos 365 días):\n';
       eventosProximos.forEach(e => {
         const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
         contextoEventos += `- ${e.titulo}: ${fecha} (${e.descripcion})\n`;
