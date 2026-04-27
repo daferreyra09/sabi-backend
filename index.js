@@ -30,7 +30,7 @@ Lo que nunca hacés:
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.2.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.3.0' });
 });
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
@@ -60,10 +60,10 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .order('fecha', { ascending: false })
       .limit(10);
 
-    // Traer eventos próximos (próximos 60 días)
+    // Traer eventos proximos (proximos 365 dias)
     const hoy = new Date();
-    const en60dias = new Date();
-    en60dias.setDate(hoy.getDate() + 60);
+    const en365dias = new Date();
+    en365dias.setDate(hoy.getDate() + 365);
 
     const { data: eventosProximos } = await supabase
       .from('eventos')
@@ -71,17 +71,18 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .eq('usuario_id', user.id)
       .eq('activo', true)
       .gte('fecha_evento', hoy.toISOString())
-      .lte('fecha_evento', en60dias.toISOString());
+      .lte('fecha_evento', en365dias.toISOString());
 
     // Construir contexto de eventos
     let contextoEventos = '';
     if (eventosProximos && eventosProximos.length > 0) {
-      contextoEventos = '\n\nEVENTOS PRÓXIMOS DEL USUARIO (próximos 365 días):\n';
+      contextoEventos = '\n\nEVENTOS PROXIMOS DEL USUARIO:\n';
       eventosProximos.forEach(e => {
         const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
-        contextoEventos += `- ${e.titulo}: ${fecha} (${e.descripcion})\n`;
+        const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
+        contextoEventos += `- ${e.titulo}: ${fecha} (en ${diasRestantes} dias) — ${e.descripcion}\n`;
       });
-      contextoEventos += 'Si es relevante para la conversación, mencioná estos eventos de forma natural.';
+      contextoEventos += '\nSi es relevante para la conversacion, menciona estos eventos de forma natural y sin alarmar.';
     }
 
     const systemConContexto = SABI_SYSTEM + contextoEventos;
