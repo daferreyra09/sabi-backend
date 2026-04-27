@@ -21,6 +21,7 @@ Principios de tono:
 - Específico, nunca genérico — todo lo que decís es para esta persona
 - Calmo, no alarmista — un dato interesante, no una emergencia
 - Breve cuando podés, profundo cuando hace falta
+- Sin exceso de emojis — solo cuando agregan algo, nunca como decoración
 Lo que nunca hacés:
 - Nunca reemplazás al médico
 - Nunca das diagnósticos
@@ -30,13 +31,12 @@ Lo que nunca hacés:
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.4.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.5.0' });
 });
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
   try {
-    // Buscar o crear usuario
     let { data: user } = await supabase
       .from('usuarios')
       .select('*')
@@ -52,7 +52,6 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       user = newUser;
     }
 
-    // Traer historial reciente
     const { data: historial } = await supabase
       .from('conversaciones')
       .select('rol, mensaje')
@@ -60,7 +59,6 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .order('fecha', { ascending: false })
       .limit(10);
 
-    // Traer eventos proximos (365 dias)
     const hoy = new Date();
     const en365dias = new Date();
     en365dias.setDate(hoy.getDate() + 365);
@@ -73,15 +71,12 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .gte('fecha_evento', hoy.toISOString())
       .lte('fecha_evento', en365dias.toISOString());
 
-    // Construir system prompt personalizado
     let systemPersonalizado = SABI_SYSTEM;
 
-    // Agregar perfil del usuario si existe
     if (user.contexto_base) {
       systemPersonalizado += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
     }
 
-    // Agregar eventos proximos
     if (eventosProximos && eventosProximos.length > 0) {
       systemPersonalizado += '\n\nEVENTOS PROXIMOS:\n';
       eventosProximos.forEach(e => {
@@ -98,14 +93,12 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     mensajesPrevios.push({ role: 'user', content: mensaje });
 
-    // Guardar mensaje del usuario
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'user',
       mensaje: mensaje
     }]);
 
-    // Respuesta de Sabi
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
@@ -115,17 +108,13 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     const respuesta = response.content[0].text;
 
-    // Guardar respuesta de Sabi
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'assistant',
       mensaje: respuesta
     }]);
 
-    res.json({ 
-      respuesta, 
-      usuario: user.nombre
-    });
+    res.json({ respuesta, usuario: user.nombre });
 
   } catch (error) {
     console.error(error);
@@ -133,7 +122,6 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
   }
 });
 
-// Check-in de cierre del dia
 app.get('/checkin/:usuario', async (req, res) => {
   const { usuario } = req.params;
   try {
@@ -146,42 +134,42 @@ app.get('/checkin/:usuario', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const checkin = {
-      mensaje: `Cerramos el día, ${user.nombre}. Cinco cositas rápidas 👇`,
+      mensaje: `¿Cómo terminó el día, ${user.nombre}?`,
       preguntas: [
         {
           id: 1,
           pregunta: '¿Cómo estuvo tu energía hoy?',
-          opciones: ['🔋🔋🔋 Alta', '🔋🔋 Normal', '🔋 Baja', '🪫 Sin nada'],
+          opciones: ['Alta', 'Normal', 'Baja', 'Sin nada'],
           pilar: 'foco_energia'
         },
         {
           id: 2,
           pregunta: '¿Cómo te sentiste por dentro?',
-          opciones: ['😊 Bien', '😐 Regular', '😔 Pesado', '🌀 Ansioso'],
+          opciones: ['Bien 😊', 'Regular', 'Pesado', 'Ansioso'],
           pilar: 'estres_recuperacion'
         },
         {
           id: 3,
           pregunta: '¿Estuviste con gente que te hace bien?',
-          opciones: ['❤️ Sí, estuvo bueno', '👋 Algo, poco', '🏠 Solo todo el día'],
+          opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'],
           pilar: 'contexto_vida'
         },
         {
           id: 4,
           pregunta: '¿Ya estás soltando el día?',
-          opciones: ['✅ Sí, desconectando', '⏳ Más o menos', '❌ Todavía en modo trabajo'],
+          opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'],
           pilar: 'estres_recuperacion'
         },
         {
           id: 5,
-          pregunta: '¿Cómo estuvo el cuerpo hoy?',
-          opciones: ['💪 Liviano y bien', '😐 Normal', '🪨 Pesado o cansado', '🤕 Algo molesto'],
+          pregunta: '¿Cómo estuvo el cuerpo?',
+          opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'],
           pilar: 'movimiento'
         },
         {
           id: 6,
-          pregunta: '¿Algo que quieras dejarme anotado del día?',
-          opciones: ['✍️ Sí, te cuento', '👌 No, ya está'],
+          pregunta: '¿Algo del día que quieras dejar anotado?',
+          opciones: ['Sí, te cuento', 'No, ya está'],
           pilar: 'contexto_vida',
           opcional: true
         }
@@ -189,6 +177,7 @@ app.get('/checkin/:usuario', async (req, res) => {
     };
 
     res.json(checkin);
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
