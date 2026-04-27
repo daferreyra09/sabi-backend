@@ -30,10 +30,9 @@ Lo que nunca hacés:
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.1.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.2.0' });
 });
 
-// Ruta de prueba desde el navegador
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
   try {
@@ -61,6 +60,32 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .order('fecha', { ascending: false })
       .limit(10);
 
+    // Traer eventos próximos (próximos 60 días)
+    const hoy = new Date();
+    const en60dias = new Date();
+    en60dias.setDate(hoy.getDate() + 60);
+
+    const { data: eventosProximos } = await supabase
+      .from('eventos')
+      .select('*')
+      .eq('usuario_id', user.id)
+      .eq('activo', true)
+      .gte('fecha_evento', hoy.toISOString())
+      .lte('fecha_evento', en60dias.toISOString());
+
+    // Construir contexto de eventos
+    let contextoEventos = '';
+    if (eventosProximos && eventosProximos.length > 0) {
+      contextoEventos = '\n\nEVENTOS PRÓXIMOS DEL USUARIO (próximos 60 días):\n';
+      eventosProximos.forEach(e => {
+        const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
+        contextoEventos += `- ${e.titulo}: ${fecha} (${e.descripcion})\n`;
+      });
+      contextoEventos += 'Si es relevante para la conversación, mencioná estos eventos de forma natural.';
+    }
+
+    const systemConContexto = SABI_SYSTEM + contextoEventos;
+
     const mensajesPrevios = (historial || [])
       .reverse()
       .map(h => ({ role: h.rol, content: h.mensaje }));
@@ -78,7 +103,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
-      system: SABI_SYSTEM,
+      system: systemConContexto,
       messages: mensajesPrevios,
     });
 
@@ -91,7 +116,12 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       mensaje: respuesta
     }]);
 
-    res.json({ respuesta, usuario: user.nombre });
+    res.json({ 
+      respuesta, 
+      usuario: user.nombre,
+      eventos_proximos: eventosProximos?.length || 0
+    });
+
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
