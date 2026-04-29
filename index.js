@@ -30,7 +30,7 @@ Lo que nunca hacés:
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente`;
 
-const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez. 
+const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
 Presentate brevemente — una sola oración. No expliques todo lo que hacés.
 Después preguntá solo su nombre. Nada más por ahora.
@@ -40,25 +40,8 @@ Después de esas tres respuestas, decile que ya tenés lo suficiente para empeza
 Tono: cálido, cercano, sin prisa. Como alguien que recién conocés pero que ya genera confianza.`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.6.0' });
+  res.json({ status: 'Sabi está vivo 🌱', version: '1.7.0' });
 });
-
-// Función para extraer datos del onboarding
-function extraerDatosOnboarding(historial) {
-  const texto = historial.map(h => h.mensaje).join(' ').toLowerCase();
-  const datos = {};
-  
-  // Intentar extraer nombre
-  const mensajesUsuario = historial.filter(h => h.rol === 'user');
-  if (mensajesUsuario.length >= 1) {
-    const primerMensaje = mensajesUsuario[0].mensaje;
-    if (primerMensaje.length < 30 && !primerMensaje.includes('?')) {
-      datos.posible_nombre = primerMensaje.trim();
-    }
-  }
-  
-  return datos;
-}
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
@@ -70,8 +53,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .eq('telefono', usuario)
       .single();
 
-    const esUsuarioNuevo = !user;
-
+    // Si no existe, crear usuario nuevo vacío
     if (!user) {
       const { data: newUser } = await supabase
         .from('usuarios')
@@ -81,7 +63,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       user = newUser;
     }
 
-    // Traer historial
+    // Traer historial reciente
     const { data: historial } = await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
@@ -90,9 +72,11 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .limit(20);
 
     const cantidadMensajes = historial ? historial.length : 0;
-    const enOnboarding = cantidadMensajes < 8;
 
-    // Traer eventos proximos
+    // Onboarding solo si no tiene perfil cargado Y tiene pocos mensajes
+    const enOnboarding = !user.contexto_base && cantidadMensajes < 8;
+
+    // Traer eventos próximos (próximos 365 días)
     const hoy = new Date();
     const en365dias = new Date();
     en365dias.setDate(hoy.getDate() + 365);
@@ -113,28 +97,30 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
-      systemFinal += '\n\nEVENTOS PROXIMOS:\n';
+      systemFinal += '\n\nEVENTOS PRÓXIMOS:\n';
       eventosProximos.forEach(e => {
         const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
         const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
-        systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} dias) — ${e.descripcion}\n`;
+        systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
       });
-      systemFinal += 'Menciona estos eventos solo cuando sea relevante.';
+      systemFinal += 'Mencioná estos eventos solo cuando sea relevante en la conversación.';
     }
 
+    // Armar mensajes para Claude
     const mensajesPrevios = (historial || [])
       .reverse()
       .map(h => ({ role: h.rol, content: h.mensaje }));
 
     mensajesPrevios.push({ role: 'user', content: mensaje });
 
-    // Guardar mensaje usuario
+    // Guardar mensaje del usuario
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'user',
       mensaje: mensaje
     }]);
 
+    // Llamar a Claude
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
@@ -144,7 +130,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     const respuesta = response.content[0].text;
 
-    // Guardar respuesta
+    // Guardar respuesta de Sabi
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'assistant',
@@ -179,7 +165,7 @@ app.get('/checkin/:usuario', async (req, res) => {
       mensaje: `¿Cómo terminó el día, ${user.nombre}?`,
       preguntas: [
         { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Sin nada'], pilar: 'foco_energia' },
-        { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien 😊', 'Regular', 'Pesado', 'Ansioso'], pilar: 'estres_recuperacion' },
+        { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'], pilar: 'estres_recuperacion' },
         { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'], pilar: 'contexto_vida' },
         { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'], pilar: 'estres_recuperacion' },
         { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'], pilar: 'movimiento' },
