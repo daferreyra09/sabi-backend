@@ -21,7 +21,7 @@ Principios de tono:
 - Específico, nunca genérico — todo lo que decís es para esta persona
 - Calmo, no alarmista — un dato interesante, no una emergencia
 - Breve cuando podés, profundo cuando hace falta
-- Sin exceso de emojis — solo cuando agregan algo, nunca como decoración
+- Sin emojis — nunca
 Lo que nunca hacés:
 - Nunca reemplazás al médico
 - Nunca das diagnósticos
@@ -32,28 +32,26 @@ Lo que nunca hacés:
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
-Presentate brevemente — una sola oración. No expliques todo lo que hacés.
+Presentate brevemente — una sola oración. Sin emojis.
 Después preguntá solo su nombre. Nada más por ahora.
 Cuando te diga el nombre, preguntá su edad.
 Cuando te diga la edad, preguntá una sola cosa: qué es lo que más quiere mejorar o entender de cómo se siente.
 Después de esas tres respuestas, decile que ya tenés lo suficiente para empezar y que puede contarte lo que quiera cuando quiera.
-Tono: cálido, cercano, sin prisa. Como alguien que recién conocés pero que ya genera confianza.`;
+Tono: cálido, cercano, sin prisa. Sin emojis.`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo 🌱', version: '1.7.0' });
+  res.json({ status: 'Sabi está vivo', version: '1.8.0' });
 });
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
   try {
-    // Buscar usuario
     let { data: user } = await supabase
       .from('usuarios')
       .select('*')
       .eq('telefono', usuario)
       .single();
 
-    // Si no existe, crear usuario nuevo vacío
     if (!user) {
       const { data: newUser } = await supabase
         .from('usuarios')
@@ -63,7 +61,6 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       user = newUser;
     }
 
-    // Traer historial reciente
     const { data: historial } = await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
@@ -72,11 +69,8 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .limit(20);
 
     const cantidadMensajes = historial ? historial.length : 0;
+    const enOnboarding = !user.base_de_contexto && cantidadMensajes < 8;
 
-    // Onboarding solo si no tiene perfil cargado Y tiene pocos mensajes
-    const enOnboarding = !user.contexto_base && cantidadMensajes < 8;
-
-    // Traer eventos próximos (próximos 365 días)
     const hoy = new Date();
     const en365dias = new Date();
     en365dias.setDate(hoy.getDate() + 365);
@@ -89,11 +83,10 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .gte('fecha_evento', hoy.toISOString())
       .lte('fecha_evento', en365dias.toISOString());
 
-    // Construir system prompt
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
-    if (!enOnboarding && user.contexto_base) {
-      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
+    if (!enOnboarding && user.base_de_contexto) {
+      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.base_de_contexto}`;
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
@@ -103,24 +96,21 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
         const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
         systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
       });
-      systemFinal += 'Mencioná estos eventos solo cuando sea relevante en la conversación.';
+      systemFinal += 'Mencioná estos eventos solo cuando sea relevante.';
     }
 
-    // Armar mensajes para Claude
     const mensajesPrevios = (historial || [])
       .reverse()
       .map(h => ({ role: h.rol, content: h.mensaje }));
 
     mensajesPrevios.push({ role: 'user', content: mensaje });
 
-    // Guardar mensaje del usuario
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'user',
       mensaje: mensaje
     }]);
 
-    // Llamar a Claude
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
@@ -130,7 +120,6 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     const respuesta = response.content[0].text;
 
-    // Guardar respuesta de Sabi
     await supabase.from('conversaciones').insert([{
       usuario_id: user.id,
       rol: 'assistant',
