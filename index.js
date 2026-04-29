@@ -69,7 +69,7 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       .limit(20);
 
     const cantidadMensajes = historial ? historial.length : 0;
-    const enOnboarding = !user.base_de_contexto && cantidadMensajes < 8;
+    const enOnboarding = !user.contexto_base && cantidadMensajes < 8;
 
     const hoy = new Date();
     const en365dias = new Date();
@@ -85,8 +85,8 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
-    if (!enOnboarding && user.base_de_contexto) {
-      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.base_de_contexto}`;
+    if (!enOnboarding && user.contexto_base) {
+      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
