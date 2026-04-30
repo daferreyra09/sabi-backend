@@ -42,12 +42,11 @@ Después de esas tres respuestas, decile que ya tenés lo suficiente para empeza
 Tono: cálido, cercano, sin prisa. Sin emojis.`;
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.0.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.1.0' });
 });
 
-// GET legacy — mantener temporalmente para pruebas desde navegador
-app.get('/chat/:usuario/:mensaje', async (req, res) => {
-  const { usuario, mensaje } = req.params;
+// Función compartida para procesar el chat
+async function procesarChat(usuario, mensaje, res) {
   try {
     let { data: user } = await supabase
       .from('usuarios')
@@ -64,15 +63,36 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       user = newUser;
     }
 
+    // Leer estado real del usuario
+    let { data: estado } = await supabase
+      .from('estado_usuario')
+      .select('*')
+      .eq('usuario_id', user.id)
+      .single();
+
+    // Si no tiene estado, crear uno nuevo (usuario sin onboarding)
+    if (!estado) {
+      const { data: nuevoEstado } = await supabase
+        .from('estado_usuario')
+        .insert([{ 
+          usuario_id: user.id,
+          onboarding_stage: 'nuevo',
+          modo_usuario: 'general',
+          madurez_sabi: 'escucha'
+        }])
+        .select()
+        .single();
+      estado = nuevoEstado;
+    }
+
+    const enOnboarding = estado.onboarding_stage !== 'completo';
+
     const { data: historial } = await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
       .eq('usuario_id', user.id)
       .order('fecha', { ascending: false })
       .limit(20);
-
-    const cantidadMensajes = historial ? historial.length : 0;
-    const enOnboarding = !user.contexto_base && cantidadMensajes < 8;
 
     const hoy = new Date();
     const en365dias = new Date();
@@ -90,6 +110,25 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
 
     if (!enOnboarding && user.contexto_base) {
       systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
+    }
+
+    // Agregar modo_usuario al contexto
+    if (!enOnboarding && estado.modo_usuario) {
+      systemFinal += `\n\nMODO: ${estado.modo_usuario}`;
+      if (estado.modo_usuario === 'adulto_mayor') {
+        systemFinal += '\nEste usuario es un adulto mayor. Tono más simple, más cálido, más pausado. Sin tecnicismos sin explicar.';
+      }
+    }
+
+    // Agregar madurez del sistema
+    if (!enOnboarding && estado.madurez_sabi) {
+      const madurezTexto = {
+        'escucha': 'Estás en etapa de escucha — primeros días. Acusá recibo, respondé consultas directas, no des insights proactivos todavía.',
+        'tendencia_temprana': 'Tenés algunos días de datos. Podés señalar tendencias tentativas pero con honestidad sobre la certeza.',
+        'patron_confirmado': 'Tenés patrones confirmados. Podés dar insights con confianza y hacer sugerencias concretas.',
+        'profundo': 'Conocés bien el ritmo de esta persona. Podés detectar desvíos y hacer conexiones sutiles entre pilares.'
+      };
+      systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estado.madurez_sabi]}`;
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
@@ -129,119 +168,39 @@ app.get('/chat/:usuario/:mensaje', async (req, res) => {
       mensaje: respuesta
     }]);
 
+    // Actualizar ultimo_mensaje_at en estado_usuario
+    await supabase
+      .from('estado_usuario')
+      .update({ ultimo_mensaje_at: new Date().toISOString() })
+      .eq('usuario_id', user.id);
+
     res.json({
       respuesta,
       usuario: user.nombre,
       onboarding: enOnboarding,
-      mensajes_totales: cantidadMensajes
+      modo: estado.modo_usuario,
+      madurez: estado.madurez_sabi
     });
 
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
+}
+
+// GET legacy — para pruebas desde navegador
+app.get('/chat/:usuario/:mensaje', async (req, res) => {
+  const { usuario, mensaje } = req.params;
+  await procesarChat(usuario, mensaje, res);
 });
 
-// POST /chat — endpoint nuevo para WhatsApp y producción
+// POST — para WhatsApp y producción
 app.post('/chat', async (req, res) => {
   const { usuario, mensaje } = req.body;
-
   if (!usuario || !mensaje) {
     return res.status(400).json({ error: 'Faltan usuario o mensaje' });
   }
-
-  try {
-    let { data: user } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('telefono', usuario)
-      .single();
-
-    if (!user) {
-      const { data: newUser } = await supabase
-        .from('usuarios')
-        .insert([{ telefono: usuario, nombre: usuario }])
-        .select()
-        .single();
-      user = newUser;
-    }
-
-    const { data: historial } = await supabase
-      .from('conversaciones')
-      .select('rol, mensaje, fecha')
-      .eq('usuario_id', user.id)
-      .order('fecha', { ascending: false })
-      .limit(20);
-
-    const cantidadMensajes = historial ? historial.length : 0;
-    const enOnboarding = !user.contexto_base && cantidadMensajes < 8;
-
-    const hoy = new Date();
-    const en365dias = new Date();
-    en365dias.setDate(hoy.getDate() + 365);
-
-    const { data: eventosProximos } = await supabase
-      .from('eventos')
-      .select('*')
-      .eq('usuario_id', user.id)
-      .eq('activo', true)
-      .gte('fecha_evento', hoy.toISOString())
-      .lte('fecha_evento', en365dias.toISOString());
-
-    let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
-
-    if (!enOnboarding && user.contexto_base) {
-      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
-    }
-
-    if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
-      systemFinal += '\n\nEVENTOS PRÓXIMOS:\n';
-      eventosProximos.forEach(e => {
-        const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
-        const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
-        systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
-      });
-      systemFinal += 'Mencioná estos eventos solo cuando sea relevante.';
-    }
-
-    const mensajesPrevios = (historial || [])
-      .reverse()
-      .map(h => ({ role: h.rol, content: h.mensaje }));
-
-    mensajesPrevios.push({ role: 'user', content: mensaje });
-
-    await supabase.from('conversaciones').insert([{
-      usuario_id: user.id,
-      rol: 'user',
-      mensaje: mensaje
-    }]);
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 500,
-      system: systemFinal,
-      messages: mensajesPrevios,
-    });
-
-    const respuesta = response.content[0].text;
-
-    await supabase.from('conversaciones').insert([{
-      usuario_id: user.id,
-      rol: 'assistant',
-      mensaje: respuesta
-    }]);
-
-    res.json({
-      respuesta,
-      usuario: user.nombre,
-      onboarding: enOnboarding,
-      mensajes_totales: cantidadMensajes
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
+  await procesarChat(usuario, mensaje, res);
 });
 
 app.get('/checkin/:usuario', async (req, res) => {
