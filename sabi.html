@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Sabi</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #f5f5f0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+#app {
+  background: #ffffff;
+  width: 100%;
+  max-width: 420px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+@media (min-width: 421px) {
+  body { padding: 20px; }
+  #app { min-height: 700px; max-height: 700px; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+}
+
+#screen-id, #screen-chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+#screen-chat { display: none; }
+
+.header {
+  padding: 24px 20px 18px;
+  border-bottom: 1px solid #ebebeb;
+}
+
+.logo {
+  font-size: 24px;
+  font-weight: 400;
+  color: #1a1a1a;
+  letter-spacing: -0.5px;
+  font-family: Georgia, serif;
+}
+
+.logo-sub {
+  font-size: 12px;
+  color: #999;
+  margin-top: 3px;
+  letter-spacing: 0.2px;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  background: #2ecc71;
+  border-radius: 50%;
+  margin-right: 5px;
+}
+
+.id-body {
+  flex: 1;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  justify-content: center;
+}
+
+.intro-text {
+  font-size: 15px;
+  color: #555;
+  line-height: 1.65;
+}
+
+.intro-text strong { color: #1a1a1a; font-weight: 500; }
+
+.field label {
+  display: block;
+  font-size: 11px;
+  color: #aaa;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.field input {
+  width: 100%;
+  padding: 13px 16px;
+  font-size: 16px;
+  border: 1px solid #e0e0e0;
+  border-radius: 10px;
+  color: #1a1a1a;
+  background: #fafafa;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.field input:focus { border-color: #aaa; background: #fff; }
+
+.btn-primary {
+  width: 100%;
+  padding: 15px;
+  background: #1a1a1a;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 15px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+
+.btn-primary:hover { opacity: 0.85; }
+.btn-primary:active { transform: scale(0.98); }
+
+.error-msg {
+  font-size: 13px;
+  color: #e74c3c;
+  text-align: center;
+  display: none;
+}
+
+.legal {
+  font-size: 11px;
+  color: #bbb;
+  text-align: center;
+  padding: 16px 24px 24px;
+  line-height: 1.5;
+}
+
+.chat-header {
+  padding: 14px 20px;
+  border-bottom: 1px solid #ebebeb;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.chat-name { font-size: 15px; font-weight: 500; color: #1a1a1a; }
+.chat-online { font-size: 12px; color: #2ecc71; margin-top: 1px; }
+
+.btn-salir {
+  font-size: 12px;
+  color: #aaa;
+  background: none;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.msg-wrap { display: flex; flex-direction: column; }
+.msg-wrap.user { align-items: flex-end; }
+.msg-wrap.sabi { align-items: flex-start; }
+
+.msg {
+  max-width: 80%;
+  padding: 10px 14px;
+  border-radius: 16px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.msg.sabi {
+  background: #f5f5f0;
+  color: #1a1a1a;
+  border-bottom-left-radius: 4px;
+}
+
+.msg.user {
+  background: #1a1a1a;
+  color: #fff;
+  border-bottom-right-radius: 4px;
+}
+
+.msg-time {
+  font-size: 10px;
+  color: #ccc;
+  margin-top: 3px;
+  padding: 0 2px;
+}
+
+.typing {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 14px;
+  background: #f5f5f0;
+  border-radius: 16px;
+  border-bottom-left-radius: 4px;
+  width: fit-content;
+}
+
+.dot {
+  width: 6px; height: 6px;
+  background: #aaa;
+  border-radius: 50%;
+  animation: bounce 1.2s infinite;
+}
+.dot:nth-child(2) { animation-delay: 0.2s; }
+.dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-5px); }
+}
+
+.input-area {
+  padding: 12px 16px;
+  border-top: 1px solid #ebebeb;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  background: #fff;
+}
+
+.chat-input {
+  flex: 1;
+  padding: 10px 14px;
+  font-size: 14px;
+  background: #f5f5f0;
+  border: 1px solid transparent;
+  border-radius: 20px;
+  color: #1a1a1a;
+  outline: none;
+  resize: none;
+  max-height: 80px;
+  line-height: 1.4;
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+
+.chat-input:focus { border-color: #e0e0e0; background: #fff; }
+
+.btn-send {
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: #1a1a1a;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+.btn-send:hover { opacity: 0.8; }
+.btn-send:active { transform: scale(0.95); }
+
+.chat-legal {
+  font-size: 10px;
+  color: #ccc;
+  text-align: center;
+  padding: 6px 16px 12px;
+  line-height: 1.4;
+}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="screen-id">
+    <div class="header">
+      <div class="logo">sabi</div>
+      <div class="logo-sub"><span class="status-dot"></span>acompañante personal de salud</div>
+    </div>
+
+    <div class="id-body">
+      <p class="intro-text">
+        <strong>Un link. Un número. Hablá con Sabi.</strong><br><br>
+        No es una app. No es un médico. Es el amigo que más sabe de vos — y que aprende con el tiempo.
+      </p>
+
+      <div class="field">
+        <label>Tu número de teléfono</label>
+        <input type="tel" id="input-phone" placeholder="Ej: 3493403866" inputmode="numeric" />
+      </div>
+
+      <p class="error-msg" id="error-msg">Ingresá un número válido para continuar.</p>
+
+      <button class="btn-primary" onclick="iniciarChat()">Hablar con Sabi</button>
+    </div>
+
+    <p class="legal">
+      Sabi no reemplaza la atención médica.<br>
+      Si tenés una urgencia, consultá a un profesional o guardia.
+    </p>
+  </div>
+
+  <div id="screen-chat">
+    <div class="chat-header">
+      <div>
+        <div class="chat-name" id="chat-nombre">Sabi</div>
+        <div class="chat-online">en línea</div>
+      </div>
+      <button class="btn-salir" onclick="cerrarSesion()">salir</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="typing" id="typing">
+        <div class="dot"></div>
+        <div class="dot"></div>
+        <div class="dot"></div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <textarea class="chat-input" id="chat-input" placeholder="Escribile a Sabi..."
+        rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button class="btn-send" onclick="enviarMensaje()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+          stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+    </div>
+
+    <p class="chat-legal">Sabi no reemplaza atención médica. Urgencias: consultá un profesional.</p>
+  </div>
+
+</div>
+
+<script>
+const BACKEND = 'https://sabi-backend-production-8705.up.railway.app';
+let telefono = '';
+
+function getHora() {
+  return new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 80) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    enviarMensaje();
+  }
+}
+
+function agregarMensaje(texto, tipo) {
+  const container = document.getElementById('messages');
+  const typing = document.getElementById('typing');
+  const wrap = document.createElement('div');
+  wrap.className = `msg-wrap ${tipo}`;
+  const msg = document.createElement('div');
+  msg.className = `msg ${tipo}`;
+  msg.textContent = texto;
+  const time = document.createElement('div');
+  time.className = 'msg-time';
+  time.textContent = getHora();
+  wrap.appendChild(msg);
+  wrap.appendChild(time);
+  container.insertBefore(wrap, typing);
+  container.scrollTop = container.scrollHeight;
+}
+
+function mostrarTyping(v) {
+  const t = document.getElementById('typing');
+  t.style.display = v ? 'flex' : 'none';
+  if (v) document.getElementById('messages').scrollTop = 99999;
+}
+
+async function iniciarChat() {
+  const input = document.getElementById('input-phone');
+  const errorEl = document.getElementById('error-msg');
+  telefono = input.value.trim().replace(/\D/g, '');
+  if (!telefono || telefono.length < 8) {
+    errorEl.style.display = 'block';
+    return;
+  }
+  errorEl.style.display = 'none';
+  localStorage.setItem('sabi_telefono', telefono);
+  document.getElementById('screen-id').style.display = 'none';
+  document.getElementById('screen-chat').style.display = 'flex';
+  mostrarTyping(true);
+  try {
+    const res = await fetch(`${BACKEND}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usuario: telefono, mensaje: 'hola' })
+    });
+    const data = await res.json();
+    mostrarTyping(false);
+    document.getElementById('chat-nombre').textContent = data.usuario || 'Sabi';
+    agregarMensaje(data.respuesta, 'sabi');
+  } catch(e) {
+    mostrarTyping(false);
+    agregarMensaje('Hubo un problema al conectar. Intentá de nuevo en un momento.', 'sabi');
+  }
+}
+
+async function enviarMensaje() {
+  const input = document.getElementById('chat-input');
+  const texto = input.value.trim();
+  if (!texto || !telefono) return;
+  input.value = '';
+  input.style.height = 'auto';
+  agregarMensaje(texto, 'user');
+  mostrarTyping(true);
+  try {
+    const res = await fetch(`${BACKEND}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ usuario: telefono, mensaje: texto })
+    });
+    const data = await res.json();
+    mostrarTyping(false);
+    agregarMensaje(data.respuesta, 'sabi');
+  } catch(e) {
+    mostrarTyping(false);
+    agregarMensaje('No pude procesar eso. Intentá de nuevo.', 'sabi');
+  }
+}
+
+function cerrarSesion() {
+  localStorage.removeItem('sabi_telefono');
+  telefono = '';
+  const msgs = document.getElementById('messages');
+  msgs.innerHTML = '<div class="typing" id="typing"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>';
+  document.getElementById('screen-chat').style.display = 'none';
+  document.getElementById('screen-id').style.display = 'flex';
+  document.getElementById('input-phone').value = '';
+}
+
+const saved = localStorage.getItem('sabi_telefono');
+if (saved) document.getElementById('input-phone').value = saved;
+</script>
+</body>
+</html>
