@@ -6,6 +6,15 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+// CORS
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -383,7 +392,7 @@ async function armarContextoReciente(usuarioId) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.6.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.6.1' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -472,7 +481,6 @@ async function procesarChat(usuario, mensaje, res) {
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
-    // Contexto temporal — hora actual Argentina
     if (!enOnboarding) {
       const horaActual = new Date().toLocaleString('es-AR', {
         timeZone: 'America/Argentina/Buenos_Aires',
