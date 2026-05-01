@@ -41,11 +41,132 @@ Cuando te diga la edad, preguntá una sola cosa: qué es lo que más quiere mejo
 Después de esas tres respuestas, decile que ya tenés lo suficiente para empezar y que puede contarte lo que quiera cuando quiera.
 Tono: cálido, cercano, sin prisa. Sin emojis.`;
 
+const SABI_EXTRACTOR = `Tu única tarea es extraer datos estructurados de un mensaje de salud.
+No respondas al usuario. No saludes. No expliques.
+Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicional, sin markdown, sin backticks.
+
+{
+  "hay_registro": true o false,
+  "tipo_registro": "sueno" | "entrenamiento" | "comida" | "estado" | "sintoma" | "evento" | null,
+  "energia": número 1-5 o null,
+  "nota_libre": "texto corto descriptivo o null",
+  "sueno_calidad": número 1-5 o null,
+  "sueno_duracion_hs": número con decimales o null,
+  "sueno_despertares": número entero o null,
+  "sueno_hora_dormir": "HH:MM" o null,
+  "sueno_hora_despertar": "HH:MM" o null,
+  "entreno_tipo": "fuerza" | "cardio" | "mixto" | "movilidad" | "descanso_activo" | null,
+  "entreno_percepcion": número 1-5 o null,
+  "entreno_ayunas": true | false | null,
+  "comida_momento": "desayuno" | "almuerzo" | "merienda" | "cena" | "snack" | null,
+  "comida_descripcion": "texto corto o null",
+  "sintoma_tipo": "texto corto o null",
+  "sintoma_intensidad": número 1-5 o null
+}
+
+Reglas estrictas:
+- Si el mensaje no contiene ningún dato de salud registrable, devolvé hay_registro: false y todo lo demás null.
+- Nunca inventes datos. Si no está en el mensaje, es null.
+- energia siempre 1-5 o null. Nunca texto.
+- tipo_registro solo puede ser uno de los valores listados.
+- entreno_tipo y comida_momento solo pueden ser los valores listados exactos.
+- nota_libre es un resumen breve de lo que dijo el usuario, siempre en tercera persona.`;
+
+// Valores permitidos para validación
+const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
+const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
+const MOMENTOS_COMIDA_VALIDOS = ['desayuno', 'almuerzo', 'merienda', 'cena', 'snack'];
+
+function validarRango(valor, min, max) {
+  if (valor === null || valor === undefined) return null;
+  const num = Number(valor);
+  if (isNaN(num) || num < min || num > max) return null;
+  return num;
+}
+
+function validarEnum(valor, permitidos) {
+  if (!valor || !permitidos.includes(valor)) return null;
+  return valor;
+}
+
+function validarExtraccion(json) {
+  return {
+    hay_registro: json.hay_registro === true,
+    tipo_registro: validarEnum(json.tipo_registro, TIPOS_REGISTRO_VALIDOS),
+    energia: validarRango(json.energia, 1, 5),
+    nota_libre: typeof json.nota_libre === 'string' ? json.nota_libre.slice(0, 300) : null,
+    sueno_calidad: validarRango(json.sueno_calidad, 1, 5),
+    sueno_duracion_hs: validarRango(json.sueno_duracion_hs, 0, 24),
+    sueno_despertares: validarRango(json.sueno_despertares, 0, 20),
+    sueno_hora_dormir: typeof json.sueno_hora_dormir === 'string' ? json.sueno_hora_dormir : null,
+    sueno_hora_despertar: typeof json.sueno_hora_despertar === 'string' ? json.sueno_hora_despertar : null,
+    entreno_tipo: validarEnum(json.entreno_tipo, TIPOS_ENTRENO_VALIDOS),
+    entreno_percepcion: validarRango(json.entreno_percepcion, 1, 5),
+    entreno_ayunas: typeof json.entreno_ayunas === 'boolean' ? json.entreno_ayunas : null,
+    comida_momento: validarEnum(json.comida_momento, MOMENTOS_COMIDA_VALIDOS),
+    comida_descripcion: typeof json.comida_descripcion === 'string' ? json.comida_descripcion.slice(0, 500) : null,
+    sintoma_tipo: typeof json.sintoma_tipo === 'string' ? json.sintoma_tipo.slice(0, 200) : null,
+    sintoma_intensidad: validarRango(json.sintoma_intensidad, 1, 5)
+  };
+}
+
+async function extraerRegistro(mensaje) {
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 300,
+      system: SABI_EXTRACTOR,
+      messages: [{ role: 'user', content: mensaje }]
+    });
+
+    const texto = response.content[0].text.trim();
+    const json = JSON.parse(texto);
+    return validarExtraccion(json);
+
+  } catch (error) {
+    console.error('Error en extracción:', error.message);
+    return { hay_registro: false };
+  }
+}
+
+async function guardarRegistro(usuarioId, mensaje, extraccion) {
+  if (!extraccion.hay_registro || !extraccion.tipo_registro) {
+    if (extraccion.hay_registro && !extraccion.tipo_registro) {
+      console.warn('Advertencia: hay_registro true pero tipo_registro null — no se guarda');
+    }
+    return;
+  }
+
+  const { error } = await supabase.from('registros').insert([{
+    usuario_id: usuarioId,
+    tipo_registro: extraccion.tipo_registro,
+    mensaje_original: mensaje,
+    origen: 'chat',
+    energia: extraccion.energia,
+    nota_libre: extraccion.nota_libre,
+    sueno_calidad: extraccion.sueno_calidad,
+    sueno_duracion_hs: extraccion.sueno_duracion_hs,
+    sueno_despertares: extraccion.sueno_despertares,
+    sueno_hora_dormir: extraccion.sueno_hora_dormir,
+    sueno_hora_despertar: extraccion.sueno_hora_despertar,
+    entreno_tipo: extraccion.entreno_tipo,
+    entreno_percepcion: extraccion.entreno_percepcion,
+    entreno_ayunas: extraccion.entreno_ayunas,
+    comida_momento: extraccion.comida_momento,
+    comida_descripcion: extraccion.comida_descripcion,
+    sintoma_tipo: extraccion.sintoma_tipo,
+    sintoma_intensidad: extraccion.sintoma_intensidad
+  }]);
+
+  if (error) {
+    console.error('Error guardando registro:', error.message);
+  }
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.1.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.2.0' });
 });
 
-// Función compartida para procesar el chat
 async function procesarChat(usuario, mensaje, res) {
   try {
     let { data: user } = await supabase
@@ -63,18 +184,16 @@ async function procesarChat(usuario, mensaje, res) {
       user = newUser;
     }
 
-    // Leer estado real del usuario
     let { data: estado } = await supabase
       .from('estado_usuario')
       .select('*')
       .eq('usuario_id', user.id)
       .single();
 
-    // Si no tiene estado, crear uno nuevo (usuario sin onboarding)
     if (!estado) {
       const { data: nuevoEstado } = await supabase
         .from('estado_usuario')
-        .insert([{ 
+        .insert([{
           usuario_id: user.id,
           onboarding_stage: 'nuevo',
           modo_usuario: 'general',
@@ -86,6 +205,13 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
+
+    // Llamada 1 — extracción (solo si no está en onboarding)
+    let extraccion = { hay_registro: false };
+    if (!enOnboarding) {
+      extraccion = await extraerRegistro(mensaje);
+      await guardarRegistro(user.id, mensaje, extraccion);
+    }
 
     const { data: historial } = await supabase
       .from('conversaciones')
@@ -112,7 +238,6 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
     }
 
-    // Agregar modo_usuario al contexto
     if (!enOnboarding && estado.modo_usuario) {
       systemFinal += `\n\nMODO: ${estado.modo_usuario}`;
       if (estado.modo_usuario === 'adulto_mayor') {
@@ -120,7 +245,6 @@ async function procesarChat(usuario, mensaje, res) {
       }
     }
 
-    // Agregar madurez del sistema
     if (!enOnboarding && estado.madurez_sabi) {
       const madurezTexto = {
         'escucha': 'Estás en etapa de escucha — primeros días. Acusá recibo, respondé consultas directas, no des insights proactivos todavía.',
@@ -129,6 +253,11 @@ async function procesarChat(usuario, mensaje, res) {
         'profundo': 'Conocés bien el ritmo de esta persona. Podés detectar desvíos y hacer conexiones sutiles entre pilares.'
       };
       systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estado.madurez_sabi]}`;
+    }
+
+    // Pasar extracción al modelo para que responda con contexto
+    if (!enOnboarding && extraccion.hay_registro) {
+      systemFinal += `\n\nDATO REGISTRADO EN ESTE MENSAJE: ${JSON.stringify(extraccion)}`;
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
@@ -153,6 +282,7 @@ async function procesarChat(usuario, mensaje, res) {
       mensaje: mensaje
     }]);
 
+    // Llamada 2 — respuesta
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
@@ -168,7 +298,6 @@ async function procesarChat(usuario, mensaje, res) {
       mensaje: respuesta
     }]);
 
-    // Actualizar ultimo_mensaje_at en estado_usuario
     await supabase
       .from('estado_usuario')
       .update({ ultimo_mensaje_at: new Date().toISOString() })
@@ -179,7 +308,8 @@ async function procesarChat(usuario, mensaje, res) {
       usuario: user.nombre,
       onboarding: enOnboarding,
       modo: estado.modo_usuario,
-      madurez: estado.madurez_sabi
+      madurez: estado.madurez_sabi,
+      registro_guardado: extraccion.hay_registro && !!extraccion.tipo_registro
     });
 
   } catch (error) {
