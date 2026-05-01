@@ -265,7 +265,6 @@ async function evaluarSenales(usuarioId) {
     );
 
     if (tieneSuenoBajo) {
-      // Buscar energía baja el mismo día o el día siguiente
       const diaSiguiente = diasOrdenados[index + 1];
       const registrosMismoDia = registrosDia;
       const registrosDiaSiguiente = diaSiguiente ? registrosPorDia[diaSiguiente] : [];
@@ -288,8 +287,111 @@ async function evaluarSenales(usuarioId) {
   }
 }
 
+async function armarContextoReciente(usuarioId) {
+  const hace7dias = new Date();
+  hace7dias.setDate(hace7dias.getDate() - 7);
+
+  const { data: registros } = await supabase
+    .from('registros')
+    .select('*')
+    .eq('usuario_id', usuarioId)
+    .gte('created_at', hace7dias.toISOString())
+    .order('created_at', { ascending: true });
+
+  if (!registros || registros.length === 0) return null;
+
+  let contexto = 'CONTEXTO RECIENTE (últimos 7 días):\n';
+
+  // SUEÑO
+  const suenos = registros.filter(r => r.tipo_registro === 'sueno');
+  if (suenos.length > 0) {
+    const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
+    const duraciones = suenos.filter(r => r.sueno_duracion_hs !== null).map(r => r.sueno_duracion_hs);
+    const nochesbajas = calidades.filter(c => c <= 2).length;
+    const promCalidad = calidades.length > 0 ? (calidades.reduce((a, b) => a + b, 0) / calidades.length).toFixed(1) : null;
+    const promDuracion = duraciones.length > 0 ? (duraciones.reduce((a, b) => a + b, 0) / duraciones.length).toFixed(1) : null;
+
+    contexto += `Sueño:\n`;
+    contexto += `- registros: ${suenos.length}\n`;
+    if (promCalidad) contexto += `- calidad promedio: ${promCalidad}/5\n`;
+    if (promDuracion) contexto += `- duración promedio: ${promDuracion}hs\n`;
+    if (nochesbajas > 0) contexto += `- noches con calidad baja (<=2): ${nochesbajas}\n`;
+  }
+
+  // ENERGÍA
+  const diasConEnergia = {};
+  registros.forEach(r => {
+    if (r.energia !== null) {
+      const dia = new Date(r.created_at).toISOString().split('T')[0];
+      if (!diasConEnergia[dia] || r.energia < diasConEnergia[dia]) {
+        diasConEnergia[dia] = r.energia;
+      }
+    }
+  });
+
+  const valoresEnergia = Object.values(diasConEnergia);
+  if (valoresEnergia.length > 0) {
+    const promEnergia = (valoresEnergia.reduce((a, b) => a + b, 0) / valoresEnergia.length).toFixed(1);
+    const diasBajos = valoresEnergia.filter(e => e <= 2).length;
+    const tendencia = diasBajos >= 3 ? 'baja repetida' : diasBajos >= 1 ? 'variable' : 'estable';
+
+    contexto += `Energía:\n`;
+    contexto += `- días registrados: ${valoresEnergia.length}\n`;
+    contexto += `- promedio: ${promEnergia}/5\n`;
+    contexto += `- tendencia: ${tendencia}\n`;
+    if (diasBajos > 0) contexto += `- días bajos (<=2): ${diasBajos}\n`;
+  }
+
+  // ENTRENAMIENTO
+  const entrenos = registros.filter(r => r.tipo_registro === 'entrenamiento');
+  if (entrenos.length > 0) {
+    const fuerza = entrenos.filter(r => r.entreno_tipo === 'fuerza').length;
+    const cardio = entrenos.filter(r => r.entreno_tipo === 'cardio').length;
+    const movilidad = entrenos.filter(r => r.entreno_tipo === 'movilidad').length;
+    const descActivo = entrenos.filter(r => r.entreno_tipo === 'descanso_activo').length;
+    const ayunas = entrenos.filter(r => r.entreno_ayunas === true).length;
+
+    contexto += `Entrenamiento:\n`;
+    contexto += `- sesiones totales: ${entrenos.length}\n`;
+    if (fuerza > 0) contexto += `- fuerza: ${fuerza}\n`;
+    if (cardio > 0) contexto += `- cardio: ${cardio}\n`;
+    if (movilidad > 0) contexto += `- movilidad: ${movilidad}\n`;
+    if (descActivo > 0) contexto += `- descanso activo: ${descActivo}\n`;
+    if (ayunas > 0) contexto += `- en ayunas: ${ayunas}\n`;
+  }
+
+  // COMIDA
+  const comidas = registros.filter(r => r.tipo_registro === 'comida');
+  if (comidas.length > 0) {
+    const almuerzos = comidas.filter(r => r.comida_momento === 'almuerzo').length;
+    const meriendas = comidas.filter(r => r.comida_momento === 'merienda').length;
+    const cenas = comidas.filter(r => r.comida_momento === 'cena').length;
+
+    contexto += `Alimentación:\n`;
+    contexto += `- registros totales: ${comidas.length}\n`;
+    if (almuerzos > 0) contexto += `- almuerzos: ${almuerzos}\n`;
+    if (meriendas > 0) contexto += `- meriendas: ${meriendas}\n`;
+    if (cenas > 0) contexto += `- cenas: ${cenas}\n`;
+  }
+
+  // SÍNTOMAS
+  const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
+  if (sintomas.length > 0) {
+    const intensidades = sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad);
+    const maxIntensidad = intensidades.length > 0 ? Math.max(...intensidades) : null;
+    const tiposUnicos = [...new Set(sintomas.filter(r => r.sintoma_tipo).map(r => r.sintoma_tipo))];
+
+    contexto += `Síntomas:\n`;
+    contexto += `- registros: ${sintomas.length}\n`;
+    if (tiposUnicos.length > 0) contexto += `- tipos: ${tiposUnicos.join(', ')}\n`;
+    if (maxIntensidad) contexto += `- intensidad máxima: ${maxIntensidad}/5\n`;
+  }
+
+  return contexto;
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.4.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.5.0' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -340,7 +442,7 @@ async function procesarChat(usuario, mensaje, res) {
       registroGuardado = await guardarRegistro(user.id, mensaje, extraccion);
     }
 
-    // Motor de señales — aislado, no bloquea respuesta
+    // Motor de señales — aislado
     if (registroGuardado) {
       try {
         await evaluarSenales(user.id);
@@ -368,7 +470,6 @@ async function procesarChat(usuario, mensaje, res) {
       .gte('fecha_evento', hoy.toISOString())
       .lte('fecha_evento', en365dias.toISOString());
 
-    // Insights pendientes para informar al modelo
     const { data: insightsPendientes } = await supabase
       .from('insights')
       .select('tipo_insight, regla_origen, evidencia_json, confianza')
@@ -376,6 +477,9 @@ async function procesarChat(usuario, mensaje, res) {
       .eq('estado', 'pendiente')
       .order('created_at', { ascending: false })
       .limit(3);
+
+    // Armar contexto reciente
+    const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
@@ -400,12 +504,17 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estado.madurez_sabi]}`;
     }
 
+    // Contexto reciente — después del perfil estable
+    if (!enOnboarding && contextoReciente) {
+      systemFinal += `\n\n${contextoReciente}`;
+    }
+
     if (!enOnboarding && extraccion.hay_registro) {
       systemFinal += `\n\nDATO REGISTRADO EN ESTE MENSAJE: ${JSON.stringify(extraccion)}`;
     }
 
     if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
-      systemFinal += '\n\nSEÑALES DETECTADAS (para tu conocimiento — mencioná solo si es relevante y natural en la conversación):\n';
+      systemFinal += '\n\nSEÑALES DETECTADAS (para tu conocimiento — mencioná solo si es relevante y natural):\n';
       insightsPendientes.forEach(i => {
         systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
@@ -419,6 +528,11 @@ async function procesarChat(usuario, mensaje, res) {
         systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
       });
       systemFinal += 'Mencioná estos eventos solo cuando sea relevante.';
+    }
+
+    // Regla de tono para uso del contexto
+    if (!enOnboarding) {
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: Usá el CONTEXTO RECIENTE solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas.';
     }
 
     const mensajesPrevios = (historial || [])
