@@ -72,7 +72,6 @@ Reglas estrictas:
 - entreno_tipo y comida_momento solo pueden ser los valores listados exactos.
 - nota_libre es un resumen breve de lo que dijo el usuario, siempre en tercera persona.`;
 
-// Valores permitidos para validación
 const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
 const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
 const MOMENTOS_COMIDA_VALIDOS = ['desayuno', 'almuerzo', 'merienda', 'cena', 'snack'];
@@ -119,12 +118,16 @@ async function extraerRegistro(mensaje) {
       messages: [{ role: 'user', content: mensaje }]
     });
 
-    const texto = response.content[0].text.trim();
+    let texto = response.content[0].text.trim();
+
+    // Limpiar markdown por si el modelo lo agrega igual
+    texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+
     const json = JSON.parse(texto);
     return validarExtraccion(json);
 
   } catch (error) {
-    console.error('Error en extracción:', error.message);
+    console.error('Error al extraer:', error.message);
     return { hay_registro: false };
   }
 }
@@ -164,7 +167,7 @@ async function guardarRegistro(usuarioId, mensaje, extraccion) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.2.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.3.0' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -206,7 +209,7 @@ async function procesarChat(usuario, mensaje, res) {
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
 
-    // Llamada 1 — extracción (solo si no está en onboarding)
+    // Llamada 1 — extracción
     let extraccion = { hay_registro: false };
     if (!enOnboarding) {
       extraccion = await extraerRegistro(mensaje);
@@ -255,7 +258,6 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estado.madurez_sabi]}`;
     }
 
-    // Pasar extracción al modelo para que responda con contexto
     if (!enOnboarding && extraccion.hay_registro) {
       systemFinal += `\n\nDATO REGISTRADO EN ESTE MENSAJE: ${JSON.stringify(extraccion)}`;
     }
@@ -318,13 +320,11 @@ async function procesarChat(usuario, mensaje, res) {
   }
 }
 
-// GET legacy — para pruebas desde navegador
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
   await procesarChat(usuario, mensaje, res);
 });
 
-// POST — para WhatsApp y producción
 app.post('/chat', async (req, res) => {
   const { usuario, mensaje } = req.body;
   if (!usuario || !mensaje) {
