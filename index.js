@@ -119,8 +119,6 @@ async function extraerRegistro(mensaje) {
     });
 
     let texto = response.content[0].text.trim();
-
-    // Limpiar markdown por si el modelo lo agrega igual
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
 
     const json = JSON.parse(texto);
@@ -137,7 +135,7 @@ async function guardarRegistro(usuarioId, mensaje, extraccion) {
     if (extraccion.hay_registro && !extraccion.tipo_registro) {
       console.warn('Advertencia: hay_registro true pero tipo_registro null — no se guarda');
     }
-    return;
+    return false;
   }
 
   const { error } = await supabase.from('registros').insert([{
@@ -163,11 +161,135 @@ async function guardarRegistro(usuarioId, mensaje, extraccion) {
 
   if (error) {
     console.error('Error guardando registro:', error.message);
+    return false;
+  }
+
+  return true;
+}
+
+async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
+  const hace14dias = new Date();
+  hace14dias.setDate(hace14dias.getDate() - 14);
+
+  const { data } = await supabase
+    .from('insights')
+    .select('id')
+    .eq('usuario_id', usuarioId)
+    .eq('tipo_insight', tipoInsight)
+    .eq('regla_origen', reglaOrigen)
+    .in('estado', ['pendiente', 'comunicado'])
+    .gte('created_at', hace14dias.toISOString())
+    .limit(1);
+
+  return data && data.length > 0;
+}
+
+async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
+  const existe = await insightExiste(usuarioId, tipoInsight, reglaOrigen);
+  if (existe) return;
+
+  const { error } = await supabase.from('insights').insert([{
+    usuario_id: usuarioId,
+    tipo_insight: tipoInsight,
+    regla_origen: reglaOrigen,
+    evidencia_json: evidencia,
+    confianza: 'tentativo',
+    estado: 'pendiente'
+  }]);
+
+  if (error) {
+    console.error('Error creando insight:', error.message);
+  } else {
+    console.log(`Insight creado: ${tipoInsight} / ${reglaOrigen}`);
+  }
+}
+
+async function evaluarSenales(usuarioId) {
+  const hace7dias = new Date();
+  hace7dias.setDate(hace7dias.getDate() - 7);
+
+  const { data: registros } = await supabase
+    .from('registros')
+    .select('tipo_registro, energia, sueno_calidad, created_at')
+    .eq('usuario_id', usuarioId)
+    .gte('created_at', hace7dias.toISOString())
+    .order('created_at', { ascending: true });
+
+  if (!registros || registros.length === 0) return;
+
+  // Regla 1 — Sueño bajo repetido
+  const registrosSuenoBajo = registros.filter(r =>
+    r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
+  );
+
+  if (registrosSuenoBajo.length >= 3) {
+    await crearInsight(usuarioId, 'sueno_recuperacion', 'sueno_bajo_repetido_7d', {
+      dias_analizados: 7,
+      registros_sueno_bajo: registrosSuenoBajo.length,
+      umbral: 2
+    });
+  }
+
+  // Regla 2 — Energía baja en días distintos
+  const diasConEnergiaBaja = new Set();
+  registros.forEach(r => {
+    if (r.energia !== null && r.energia <= 2) {
+      const dia = new Date(r.created_at).toISOString().split('T')[0];
+      diasConEnergiaBaja.add(dia);
+    }
+  });
+
+  if (diasConEnergiaBaja.size >= 3) {
+    await crearInsight(usuarioId, 'energia_sostenida', 'energia_baja_repetida_7d', {
+      dias_analizados: 7,
+      dias_con_energia_baja: diasConEnergiaBaja.size,
+      umbral: 2
+    });
+  }
+
+  // Regla 3 — Correlación sueño bajo → energía baja
+  const registrosPorDia = {};
+  registros.forEach(r => {
+    const dia = new Date(r.created_at).toISOString().split('T')[0];
+    if (!registrosPorDia[dia]) registrosPorDia[dia] = [];
+    registrosPorDia[dia].push(r);
+  });
+
+  let correlaciones = 0;
+  const diasOrdenados = Object.keys(registrosPorDia).sort();
+
+  diasOrdenados.forEach((dia, index) => {
+    const registrosDia = registrosPorDia[dia];
+    const tieneSuenoBajo = registrosDia.some(r =>
+      r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
+    );
+
+    if (tieneSuenoBajo) {
+      // Buscar energía baja el mismo día o el día siguiente
+      const diaSiguiente = diasOrdenados[index + 1];
+      const registrosMismoDia = registrosDia;
+      const registrosDiaSiguiente = diaSiguiente ? registrosPorDia[diaSiguiente] : [];
+
+      const energiaBaja = [...registrosMismoDia, ...registrosDiaSiguiente].some(r =>
+        r.energia !== null && r.energia <= 2
+      );
+
+      if (energiaBaja) correlaciones++;
+    }
+  });
+
+  if (correlaciones >= 2) {
+    await crearInsight(usuarioId, 'sueno_energia', 'sueno_bajo_energia_baja_7d', {
+      dias_analizados: 7,
+      correlaciones_detectadas: correlaciones,
+      umbral_sueno: 2,
+      umbral_energia: 2
+    });
   }
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.3.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.4.0' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -211,9 +333,20 @@ async function procesarChat(usuario, mensaje, res) {
 
     // Llamada 1 — extracción
     let extraccion = { hay_registro: false };
+    let registroGuardado = false;
+
     if (!enOnboarding) {
       extraccion = await extraerRegistro(mensaje);
-      await guardarRegistro(user.id, mensaje, extraccion);
+      registroGuardado = await guardarRegistro(user.id, mensaje, extraccion);
+    }
+
+    // Motor de señales — aislado, no bloquea respuesta
+    if (registroGuardado) {
+      try {
+        await evaluarSenales(user.id);
+      } catch (error) {
+        console.error('Error evaluando señales:', error.message);
+      }
     }
 
     const { data: historial } = await supabase
@@ -234,6 +367,15 @@ async function procesarChat(usuario, mensaje, res) {
       .eq('activo', true)
       .gte('fecha_evento', hoy.toISOString())
       .lte('fecha_evento', en365dias.toISOString());
+
+    // Insights pendientes para informar al modelo
+    const { data: insightsPendientes } = await supabase
+      .from('insights')
+      .select('tipo_insight, regla_origen, evidencia_json, confianza')
+      .eq('usuario_id', user.id)
+      .eq('estado', 'pendiente')
+      .order('created_at', { ascending: false })
+      .limit(3);
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
@@ -260,6 +402,13 @@ async function procesarChat(usuario, mensaje, res) {
 
     if (!enOnboarding && extraccion.hay_registro) {
       systemFinal += `\n\nDATO REGISTRADO EN ESTE MENSAJE: ${JSON.stringify(extraccion)}`;
+    }
+
+    if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
+      systemFinal += '\n\nSEÑALES DETECTADAS (para tu conocimiento — mencioná solo si es relevante y natural en la conversación):\n';
+      insightsPendientes.forEach(i => {
+        systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
+      });
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
@@ -311,7 +460,8 @@ async function procesarChat(usuario, mensaje, res) {
       onboarding: enOnboarding,
       modo: estado.modo_usuario,
       madurez: estado.madurez_sabi,
-      registro_guardado: extraccion.hay_registro && !!extraccion.tipo_registro
+      registro_guardado: registroGuardado,
+      insights_pendientes: insightsPendientes ? insightsPendientes.length : 0
     });
 
   } catch (error) {
