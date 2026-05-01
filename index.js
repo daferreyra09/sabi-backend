@@ -533,8 +533,7 @@ async function procesarChat(usuario, mensaje, res) {
 
     // Regla de tono para uso del contexto
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: Usá el CONTEXTO RECIENTE solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas.';
-    }
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y el DATO REGISTRADO EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Si el perfil dice que el sueño suele ser bueno pero el contexto reciente muestra sueño bajo, respondé desde los datos recientes. Usá el contexto reciente solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas.'
 
     const mensajesPrevios = (historial || [])
       .reverse()
