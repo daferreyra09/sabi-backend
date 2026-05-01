@@ -532,7 +532,7 @@ async function procesarChat(usuario, mensaje, res) {
 
     // Regla de tono para uso del contexto
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: Usá el CONTEXTO RECIENTE solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y el DATO REGISTRADO EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Usá el contexto reciente solo si es relevante. No lo menciones completo ni hagas resumen salvo que el usuario lo pida. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si registró la cena, no abrís nada más — solo cerrás el día. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
     }
 
     const mensajesPrevios = (historial || [])
