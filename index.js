@@ -22,6 +22,7 @@ Principios de tono:
 - Calmo, no alarmista — un dato interesante, no una emergencia
 - Breve cuando podés, profundo cuando hace falta
 - Sin emojis — nunca
+- Sin markdown — nunca uses asteriscos, negrita, cursiva ni bullets. Solo texto plano.
 - Con adultos mayores: tono más pausado, más cálido, más simple. Nada técnico sin explicar.
 Lo que nunca hacés:
 - Nunca reemplazás al médico
@@ -217,7 +218,6 @@ async function evaluarSenales(usuarioId) {
 
   if (!registros || registros.length === 0) return;
 
-  // Regla 1 — Sueño bajo repetido
   const registrosSuenoBajo = registros.filter(r =>
     r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
   );
@@ -230,7 +230,6 @@ async function evaluarSenales(usuarioId) {
     });
   }
 
-  // Regla 2 — Energía baja en días distintos
   const diasConEnergiaBaja = new Set();
   registros.forEach(r => {
     if (r.energia !== null && r.energia <= 2) {
@@ -247,7 +246,6 @@ async function evaluarSenales(usuarioId) {
     });
   }
 
-  // Regla 3 — Correlación sueño bajo → energía baja
   const registrosPorDia = {};
   registros.forEach(r => {
     const dia = new Date(r.created_at).toISOString().split('T')[0];
@@ -266,10 +264,9 @@ async function evaluarSenales(usuarioId) {
 
     if (tieneSuenoBajo) {
       const diaSiguiente = diasOrdenados[index + 1];
-      const registrosMismoDia = registrosDia;
       const registrosDiaSiguiente = diaSiguiente ? registrosPorDia[diaSiguiente] : [];
 
-      const energiaBaja = [...registrosMismoDia, ...registrosDiaSiguiente].some(r =>
+      const energiaBaja = [...registrosDia, ...registrosDiaSiguiente].some(r =>
         r.energia !== null && r.energia <= 2
       );
 
@@ -302,7 +299,6 @@ async function armarContextoReciente(usuarioId) {
 
   let contexto = 'CONTEXTO RECIENTE (últimos 7 días):\n';
 
-  // SUEÑO
   const suenos = registros.filter(r => r.tipo_registro === 'sueno');
   if (suenos.length > 0) {
     const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
@@ -318,7 +314,6 @@ async function armarContextoReciente(usuarioId) {
     if (nochesbajas > 0) contexto += `- noches con calidad baja (<=2): ${nochesbajas}\n`;
   }
 
-  // ENERGÍA
   const diasConEnergia = {};
   registros.forEach(r => {
     if (r.energia !== null) {
@@ -342,7 +337,6 @@ async function armarContextoReciente(usuarioId) {
     if (diasBajos > 0) contexto += `- días bajos (<=2): ${diasBajos}\n`;
   }
 
-  // ENTRENAMIENTO
   const entrenos = registros.filter(r => r.tipo_registro === 'entrenamiento');
   if (entrenos.length > 0) {
     const fuerza = entrenos.filter(r => r.entreno_tipo === 'fuerza').length;
@@ -360,7 +354,6 @@ async function armarContextoReciente(usuarioId) {
     if (ayunas > 0) contexto += `- en ayunas: ${ayunas}\n`;
   }
 
-  // COMIDA
   const comidas = registros.filter(r => r.tipo_registro === 'comida');
   if (comidas.length > 0) {
     const almuerzos = comidas.filter(r => r.comida_momento === 'almuerzo').length;
@@ -374,7 +367,6 @@ async function armarContextoReciente(usuarioId) {
     if (cenas > 0) contexto += `- cenas: ${cenas}\n`;
   }
 
-  // SÍNTOMAS
   const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
   if (sintomas.length > 0) {
     const intensidades = sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad);
@@ -391,7 +383,7 @@ async function armarContextoReciente(usuarioId) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.5.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.6.0' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -433,7 +425,6 @@ async function procesarChat(usuario, mensaje, res) {
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
 
-    // Llamada 1 — extracción
     let extraccion = { hay_registro: false };
     let registroGuardado = false;
 
@@ -442,7 +433,6 @@ async function procesarChat(usuario, mensaje, res) {
       registroGuardado = await guardarRegistro(user.id, mensaje, extraccion);
     }
 
-    // Motor de señales — aislado
     if (registroGuardado) {
       try {
         await evaluarSenales(user.id);
@@ -478,10 +468,20 @@ async function procesarChat(usuario, mensaje, res) {
       .order('created_at', { ascending: false })
       .limit(3);
 
-    // Armar contexto reciente
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
+
+    // Contexto temporal — hora actual Argentina
+    if (!enOnboarding) {
+      const horaActual = new Date().toLocaleString('es-AR', {
+        timeZone: 'America/Argentina/Buenos_Aires',
+        hour: '2-digit',
+        minute: '2-digit',
+        weekday: 'long'
+      });
+      systemFinal += `\n\nCONTEXTO TEMPORAL: Hoy es ${horaActual} (hora Argentina). Usá esto para calibrar qué momento del día es y qué registro tiene sentido sugerir a continuación.`;
+    }
 
     if (!enOnboarding && user.contexto_base) {
       systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
@@ -504,7 +504,6 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estado.madurez_sabi]}`;
     }
 
-    // Contexto reciente — después del perfil estable
     if (!enOnboarding && contextoReciente) {
       systemFinal += `\n\n${contextoReciente}`;
     }
@@ -530,9 +529,8 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += 'Mencioná estos eventos solo cuando sea relevante.';
     }
 
-    // Regla de tono para uso del contexto
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y el DATO REGISTRADO EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Usá el contexto reciente solo si es relevante. No lo menciones completo ni hagas resumen salvo que el usuario lo pida. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si registró la cena, no abrís nada más — solo cerrás el día. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y el DATO REGISTRADO EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Si el perfil dice que el sueño suele ser bueno pero el contexto reciente muestra sueño bajo, respondé desde los datos recientes. Usá el contexto reciente solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si registró la cena, no abrís nada más — solo cerrás el día. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
     }
 
     const mensajesPrevios = (historial || [])
@@ -547,7 +545,6 @@ async function procesarChat(usuario, mensaje, res) {
       mensaje: mensaje
     }]);
 
-    // Llamada 2 — respuesta
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 500,
