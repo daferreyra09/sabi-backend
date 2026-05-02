@@ -39,9 +39,9 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje es "primera_apertura_del_dia": ignorá el historial de conversaciones anteriores para este saludo. Saludá por nombre con "Hola [nombre]." y hacé UNA pregunta concreta basada en el contexto reciente y la hora del día. Ejemplos: mañana → "Hola Daniel. ¿Cómo dormiste anoche?", mediodía → "Hola Daniel. ¿Ya entrenaste hoy?", tarde → "Hola Daniel. ¿Cómo viene la tarde?". Siempre empezá con "Hola [nombre]." — nunca omitás el saludo.
-- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante del momento actual del día, considerando la hora y lo ya registrado hoy.
-- Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, Daniel." Sin abrir nuevas preguntas.`;
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera vez que el usuario abre la app hoy. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y el contexto reciente. Sin excepción.
+- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante del momento actual.
+- Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -80,9 +80,9 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
 
 Reglas estrictas:
 - Si no hay ningún dato de salud registrable: devolvé {"registros": []}
-- Los mensajes "primera_apertura_del_dia" y "reapertura_del_dia" no son registros de salud. Devolvé {"registros": []}
+- Mensajes que empiezan con "APERTURA_DIA:" y el mensaje "reapertura_del_dia" no son registros de salud. Devolvé {"registros": []}
 - Cada objeto del array representa un evento de salud distinto
-- Puede haber más de un objeto del mismo tipo si son momentos distintos. Ejemplo: almuerzo y cena son dos objetos tipo "comida"
+- Puede haber más de un objeto del mismo tipo si son momentos distintos
 - No duplicar el mismo evento dentro del mismo mensaje
 - Todos los campos deben estar presentes en cada objeto. Los que no aplican van en null
 - Nunca texto donde corresponde número
@@ -110,7 +110,6 @@ function validarEnum(valor, permitidos) {
 function validarRegistro(obj) {
   const tipo = validarEnum(obj.tipo_registro, TIPOS_REGISTRO_VALIDOS);
   if (!tipo) return null;
-
   return {
     tipo_registro: tipo,
     energia: validarRango(obj.energia, 1, 5),
@@ -143,13 +142,9 @@ async function extraerRegistros(mensaje) {
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
 
     const json = JSON.parse(texto);
-
     if (!Array.isArray(json.registros)) return [];
 
-    return json.registros
-      .map(r => validarRegistro(r))
-      .filter(r => r !== null);
-
+    return json.registros.map(r => validarRegistro(r)).filter(r => r !== null);
   } catch (error) {
     console.error('Error al extraer:', error.message);
     return [];
@@ -158,7 +153,6 @@ async function extraerRegistros(mensaje) {
 
 async function guardarRegistros(usuarioId, mensaje, registros) {
   if (!registros || registros.length === 0) return 0;
-
   let guardados = 0;
   for (const registro of registros) {
     const { error } = await supabase.from('registros').insert([{
@@ -181,7 +175,6 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
       sintoma_tipo: registro.sintoma_tipo,
       sintoma_intensidad: registro.sintoma_intensidad
     }]);
-
     if (error) {
       console.error(`Error guardando registro ${registro.tipo_registro}:`, error.message);
     } else {
@@ -194,7 +187,6 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
 async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
   const hace14dias = new Date();
   hace14dias.setDate(hace14dias.getDate() - 14);
-
   const { data } = await supabase
     .from('insights')
     .select('id')
@@ -204,14 +196,12 @@ async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
     .in('estado', ['pendiente', 'comunicado'])
     .gte('created_at', hace14dias.toISOString())
     .limit(1);
-
   return data && data.length > 0;
 }
 
 async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
   const existe = await insightExiste(usuarioId, tipoInsight, reglaOrigen);
   if (existe) return;
-
   const { error } = await supabase.from('insights').insert([{
     usuario_id: usuarioId,
     tipo_insight: tipoInsight,
@@ -220,7 +210,6 @@ async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
     confianza: 'tentativo',
     estado: 'pendiente'
   }]);
-
   if (error) {
     console.error('Error creando insight:', error.message);
   } else {
@@ -231,7 +220,6 @@ async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
 async function evaluarSenales(usuarioId) {
   const hace7dias = new Date();
   hace7dias.setDate(hace7dias.getDate() - 7);
-
   const { data: registros } = await supabase
     .from('registros')
     .select('tipo_registro, energia, sueno_calidad, created_at')
@@ -295,7 +283,6 @@ async function evaluarSenales(usuarioId) {
 async function armarContextoReciente(usuarioId) {
   const hace7dias = new Date();
   hace7dias.setDate(hace7dias.getDate() - 7);
-
   const { data: registros } = await supabase
     .from('registros')
     .select('*')
@@ -375,15 +362,30 @@ async function armarContextoReciente(usuarioId) {
   return contexto;
 }
 
+function getFechaArgentina() {
+  // Devuelve la fecha de hoy en Argentina como string YYYY-MM-DD
+  const ahora = new Date();
+  const argentinaStr = ahora.toLocaleDateString('en-CA', {
+    timeZone: 'America/Argentina/Buenos_Aires'
+  });
+  return argentinaStr; // formato YYYY-MM-DD
+}
+
+function getInicioHoyArgentina() {
+  // Devuelve el inicio del día de hoy en Argentina como objeto Date UTC
+  const hoyArg = getFechaArgentina(); // YYYY-MM-DD
+  // Medianoche en Argentina = hoyArg T03:00:00Z (UTC-3)
+  return new Date(hoyArg + 'T03:00:00.000Z');
+}
+
 async function armarRegistrosHoy(usuarioId) {
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
+  const inicioHoy = getInicioHoyArgentina();
 
   const { data: registros } = await supabase
     .from('registros')
     .select('tipo_registro, comida_momento, created_at')
     .eq('usuario_id', usuarioId)
-    .gte('created_at', hoy.toISOString())
+    .gte('created_at', inicioHoy.toISOString())
     .order('created_at', { ascending: true });
 
   if (!registros || registros.length === 0) return 'Hoy no hay registros todavía.';
@@ -393,11 +395,11 @@ async function armarRegistrosHoy(usuarioId) {
     return r.tipo_registro;
   });
 
-  return `Registrado hoy: ${tipos.join(', ')}.`;
+  return `Registrado hoy (${getFechaArgentina()}): ${tipos.join(', ')}.`;
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.7.1' });
+  res.json({ status: 'Sabi está vivo', version: '2.7.2' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -438,7 +440,9 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
-    const esMensajeSistema = ['primera_apertura_del_dia', 'reapertura_del_dia'].includes(mensaje);
+    const esAperturaDia = mensaje.startsWith('APERTURA_DIA:');
+    const esReapertura = mensaje === 'reapertura_del_dia';
+    const esMensajeSistema = esAperturaDia || esReapertura;
 
     let registrosExtraidos = [];
     let cantidadGuardada = 0;
@@ -456,15 +460,15 @@ async function procesarChat(usuario, mensaje, res) {
       }
     }
 
-    // Para mensajes sistema, traer solo los últimos 5 mensajes — no el historial completo
-    const limiteHistorial = esMensajeSistema ? 5 : 20;
+    // Apertura del día: sin historial — respuesta limpia sin contexto conversacional previo
+    const limiteHistorial = esAperturaDia ? 0 : 20;
 
-    const { data: historial } = await supabase
+    const { data: historial } = limiteHistorial > 0 ? await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
       .eq('usuario_id', user.id)
       .order('fecha', { ascending: false })
-      .limit(limiteHistorial);
+      .limit(limiteHistorial) : { data: [] };
 
     const hoy = new Date();
     const en365dias = new Date();
@@ -492,9 +496,7 @@ async function procesarChat(usuario, mensaje, res) {
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
     if (!enOnboarding) {
-      // Fecha y hora completa con día de la semana y fecha para que distinga ayer de hoy
-      const ahora = new Date();
-      const fechaCompleta = ahora.toLocaleString('es-AR', {
+      const fechaCompleta = new Date().toLocaleString('es-AR', {
         timeZone: 'America/Argentina/Buenos_Aires',
         weekday: 'long',
         year: 'numeric',
@@ -503,7 +505,7 @@ async function procesarChat(usuario, mensaje, res) {
         hour: '2-digit',
         minute: '2-digit'
       });
-      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir correctamente qué pasó hoy, qué pasó ayer, y qué momento del día es ahora. Cualquier mensaje que hable de "ayer" o "anoche" se refiere al día anterior a esta fecha.`;
+      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir correctamente qué pasó hoy, qué pasó ayer, y qué momento del día es ahora. Cualquier evento mencionado como "ayer" o "anoche" es del día anterior a esta fecha.`;
     }
 
     if (!enOnboarding && user.contexto_base) {
@@ -557,7 +559,7 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. Usá REGISTROS DE HOY para saber qué ya registró hoy y no repetir sugerencias. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día con un mensaje breve y cálido sin abrir nuevas preguntas. Después de acusar recibo, podés sugerir el próximo momento lógico del día en forma de pregunta breve usando la rutina conocida pero sin asumir. Nunca más de una sugerencia por mensaje. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica exactamente qué ya fue registrado hoy — no menciones ni preguntes sobre algo que ya está registrado. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día con un mensaje breve y cálido sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día en forma de pregunta breve usando la rutina conocida pero sin asumir. Nunca más de una sugerencia por mensaje. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
