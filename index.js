@@ -6,7 +6,6 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -40,7 +39,8 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-Cuando alguien te saluda por primera vez en el día, no respondas con un saludo genérico. Preguntá algo concreto relacionado a su contexto. Con adultos mayores, algo simple: cómo amaneció, cómo está el cuerpo, si descansó bien.`;
+- Si el mensaje es "primera_apertura_del_dia": saludá por nombre y hacé una pregunta concreta del contexto. Ejemplo: "Hola Daniel. ¿Cómo dormiste anoche?" o "Hola Daniel. ¿Ya entrenaste hoy?". Siempre empezá con "Hola [nombre]."
+- Si el mensaje es "reapertura_del_dia": no saludes, preguntá directamente algo relevante del momento del día. Sin hola, sin bienvenido de vuelta.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -76,6 +76,7 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
 
 Reglas estrictas:
 - Si el mensaje no contiene ningún dato de salud registrable, devolvé hay_registro: false y todo lo demás null.
+- Los mensajes "primera_apertura_del_dia" y "reapertura_del_dia" son mensajes del sistema, no registros de salud. Devolvé hay_registro: false.
 - Nunca inventes datos. Si no está en el mensaje, es null.
 - energia siempre 1-5 o null. Nunca texto.
 - tipo_registro solo puede ser uno de los valores listados.
@@ -315,9 +316,7 @@ async function armarContextoReciente(usuarioId) {
     const nochesbajas = calidades.filter(c => c <= 2).length;
     const promCalidad = calidades.length > 0 ? (calidades.reduce((a, b) => a + b, 0) / calidades.length).toFixed(1) : null;
     const promDuracion = duraciones.length > 0 ? (duraciones.reduce((a, b) => a + b, 0) / duraciones.length).toFixed(1) : null;
-
-    contexto += `Sueño:\n`;
-    contexto += `- registros: ${suenos.length}\n`;
+    contexto += `Sueño:\n- registros: ${suenos.length}\n`;
     if (promCalidad) contexto += `- calidad promedio: ${promCalidad}/5\n`;
     if (promDuracion) contexto += `- duración promedio: ${promDuracion}hs\n`;
     if (nochesbajas > 0) contexto += `- noches con calidad baja (<=2): ${nochesbajas}\n`;
@@ -338,11 +337,7 @@ async function armarContextoReciente(usuarioId) {
     const promEnergia = (valoresEnergia.reduce((a, b) => a + b, 0) / valoresEnergia.length).toFixed(1);
     const diasBajos = valoresEnergia.filter(e => e <= 2).length;
     const tendencia = diasBajos >= 3 ? 'baja repetida' : diasBajos >= 1 ? 'variable' : 'estable';
-
-    contexto += `Energía:\n`;
-    contexto += `- días registrados: ${valoresEnergia.length}\n`;
-    contexto += `- promedio: ${promEnergia}/5\n`;
-    contexto += `- tendencia: ${tendencia}\n`;
+    contexto += `Energía:\n- días registrados: ${valoresEnergia.length}\n- promedio: ${promEnergia}/5\n- tendencia: ${tendencia}\n`;
     if (diasBajos > 0) contexto += `- días bajos (<=2): ${diasBajos}\n`;
   }
 
@@ -353,9 +348,7 @@ async function armarContextoReciente(usuarioId) {
     const movilidad = entrenos.filter(r => r.entreno_tipo === 'movilidad').length;
     const descActivo = entrenos.filter(r => r.entreno_tipo === 'descanso_activo').length;
     const ayunas = entrenos.filter(r => r.entreno_ayunas === true).length;
-
-    contexto += `Entrenamiento:\n`;
-    contexto += `- sesiones totales: ${entrenos.length}\n`;
+    contexto += `Entrenamiento:\n- sesiones totales: ${entrenos.length}\n`;
     if (fuerza > 0) contexto += `- fuerza: ${fuerza}\n`;
     if (cardio > 0) contexto += `- cardio: ${cardio}\n`;
     if (movilidad > 0) contexto += `- movilidad: ${movilidad}\n`;
@@ -368,9 +361,7 @@ async function armarContextoReciente(usuarioId) {
     const almuerzos = comidas.filter(r => r.comida_momento === 'almuerzo').length;
     const meriendas = comidas.filter(r => r.comida_momento === 'merienda').length;
     const cenas = comidas.filter(r => r.comida_momento === 'cena').length;
-
-    contexto += `Alimentación:\n`;
-    contexto += `- registros totales: ${comidas.length}\n`;
+    contexto += `Alimentación:\n- registros totales: ${comidas.length}\n`;
     if (almuerzos > 0) contexto += `- almuerzos: ${almuerzos}\n`;
     if (meriendas > 0) contexto += `- meriendas: ${meriendas}\n`;
     if (cenas > 0) contexto += `- cenas: ${cenas}\n`;
@@ -381,9 +372,7 @@ async function armarContextoReciente(usuarioId) {
     const intensidades = sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad);
     const maxIntensidad = intensidades.length > 0 ? Math.max(...intensidades) : null;
     const tiposUnicos = [...new Set(sintomas.filter(r => r.sintoma_tipo).map(r => r.sintoma_tipo))];
-
-    contexto += `Síntomas:\n`;
-    contexto += `- registros: ${sintomas.length}\n`;
+    contexto += `Síntomas:\n- registros: ${sintomas.length}\n`;
     if (tiposUnicos.length > 0) contexto += `- tipos: ${tiposUnicos.join(', ')}\n`;
     if (maxIntensidad) contexto += `- intensidad máxima: ${maxIntensidad}/5\n`;
   }
@@ -392,7 +381,7 @@ async function armarContextoReciente(usuarioId) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.6.1' });
+  res.json({ status: 'Sabi está vivo', version: '2.6.2' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -433,11 +422,12 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
+    const esMensajeSistema = ['primera_apertura_del_dia', 'reapertura_del_dia'].includes(mensaje);
 
     let extraccion = { hay_registro: false };
     let registroGuardado = false;
 
-    if (!enOnboarding) {
+    if (!enOnboarding && !esMensajeSistema) {
       extraccion = await extraerRegistro(mensaje);
       registroGuardado = await guardarRegistro(user.id, mensaje, extraccion);
     }
@@ -547,11 +537,13 @@ async function procesarChat(usuario, mensaje, res) {
 
     mensajesPrevios.push({ role: 'user', content: mensaje });
 
-    await supabase.from('conversaciones').insert([{
-      usuario_id: user.id,
-      rol: 'user',
-      mensaje: mensaje
-    }]);
+    if (!esMensajeSistema) {
+      await supabase.from('conversaciones').insert([{
+        usuario_id: user.id,
+        rol: 'user',
+        mensaje: mensaje
+      }]);
+    }
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
