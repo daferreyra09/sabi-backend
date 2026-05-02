@@ -4,8 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -40,10 +40,10 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y el contexto reciente. Sin excepción.
-- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante del momento actual.
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y los registros disponibles. Usá esta lógica de horario para elegir qué preguntar: antes de las 13:00 → sueño o entrenamiento de la mañana; entre 13:00 y 16:00 → cómo estuvo el almuerzo o la energía post-almuerzo; entre 16:00 y 20:00 → merienda o entrenamiento de la tarde; después de las 20:00 → cena o cierre del día. Nunca preguntes por algo que ya está en REGISTROS DE HOY.
+- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante según la hora actual y lo que falta registrar hoy.
 - Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas.
-- Si recibís una imagen: describí brevemente lo que ves en términos de salud (comida, datos del reloj, análisis, etc.) y acusá recibo de los datos que pudiste extraer. Sé específico con lo que ves.`;
+- Si recibís imágenes: describí brevemente lo que ves en términos de salud (comida, datos del reloj, análisis, etc.) y acusá recibo de los datos que pudiste extraer.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -92,7 +92,7 @@ Reglas estrictas:
 - tipo_registro solo puede ser uno de los valores listados
 - entreno_tipo y comida_momento solo pueden ser los valores listados exactos
 - nota_libre siempre en tercera persona
-- Si recibís una imagen: extraé todos los datos de salud visibles (comida, métricas del reloj, análisis de sangre, etc.) con el mismo formato`;
+- Si recibís imágenes: extraé todos los datos de salud visibles con el mismo formato`;
 
 const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
 const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
@@ -132,27 +132,22 @@ function validarRegistro(obj) {
   };
 }
 
-async function extraerRegistros(mensaje, imagenBase64, imagenTipo) {
+async function extraerRegistros(mensaje, imagenes) {
   try {
     let contenidoUsuario;
 
-    if (imagenBase64 && imagenTipo) {
-      // Mensaje con imagen
-      contenidoUsuario = [
-        {
+    if (imagenes && imagenes.length > 0) {
+      contenidoUsuario = [];
+      for (const img of imagenes) {
+        contenidoUsuario.push({
           type: 'image',
-          source: {
-            type: 'base64',
-            media_type: imagenTipo,
-            data: imagenBase64
-          }
-        }
-      ];
-      if (mensaje && mensaje.trim()) {
-        contenidoUsuario.push({ type: 'text', text: mensaje });
-      } else {
-        contenidoUsuario.push({ type: 'text', text: 'Extraé los datos de salud de esta imagen.' });
+          source: { type: 'base64', media_type: img.tipo, data: img.base64 }
+        });
       }
+      contenidoUsuario.push({
+        type: 'text',
+        text: mensaje && mensaje.trim() ? mensaje : 'Extraé los datos de salud de estas imágenes.'
+      });
     } else {
       contenidoUsuario = mensaje;
     }
@@ -418,30 +413,24 @@ async function armarRegistrosHoy(usuarioId) {
   return `Registrado hoy (${getFechaArgentina()}): ${tipos.join(', ')}.`;
 }
 
-async function generarRespuestaConImagen(systemFinal, mensajesPrevios, mensaje, imagenBase64, imagenTipo) {
-  // Construir el último mensaje con imagen
-  const ultimoMensaje = {
-    role: 'user',
-    content: [
-      {
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: imagenTipo,
-          data: imagenBase64
-        }
-      }
-    ]
-  };
-
+async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes) {
+  const contenidoImagen = [];
+  for (const img of imagenes) {
+    contenidoImagen.push({
+      type: 'image',
+      source: { type: 'base64', media_type: img.tipo, data: img.base64 }
+    });
+  }
   if (mensaje && mensaje.trim()) {
-    ultimoMensaje.content.push({ type: 'text', text: mensaje });
+    contenidoImagen.push({ type: 'text', text: mensaje });
   } else {
-    ultimoMensaje.content.push({ type: 'text', text: 'Mirá esta imagen y respondé como Sabi.' });
+    contenidoImagen.push({ type: 'text', text: 'Mirá estas imágenes y respondé como Sabi.' });
   }
 
-  // Reemplazar el último mensaje de texto por el mensaje con imagen
-  const mensajesConImagen = [...mensajesPrevios.slice(0, -1), ultimoMensaje];
+  const mensajesConImagen = [
+    ...mensajesPrevios.slice(0, -1),
+    { role: 'user', content: contenidoImagen }
+  ];
 
   return await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
@@ -452,10 +441,10 @@ async function generarRespuestaConImagen(systemFinal, mensajesPrevios, mensaje, 
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.8.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.9.0' });
 });
 
-async function procesarChat(usuario, mensaje, res, imagenBase64, imagenTipo) {
+async function procesarChat(usuario, mensaje, res, imagenes) {
   try {
     let { data: user } = await supabase
       .from('usuarios')
@@ -496,13 +485,13 @@ async function procesarChat(usuario, mensaje, res, imagenBase64, imagenTipo) {
     const esAperturaDia = mensaje && mensaje.startsWith('APERTURA_DIA:');
     const esReapertura = mensaje === 'reapertura_del_dia';
     const esMensajeSistema = esAperturaDia || esReapertura;
-    const tieneImagen = !!(imagenBase64 && imagenTipo);
+    const tieneImagenes = imagenes && imagenes.length > 0;
 
     let registrosExtraidos = [];
     let cantidadGuardada = 0;
 
     if (!enOnboarding && !esMensajeSistema) {
-      registrosExtraidos = await extraerRegistros(mensaje, imagenBase64, imagenTipo);
+      registrosExtraidos = await extraerRegistros(mensaje, imagenes);
       cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
     }
 
@@ -611,26 +600,29 @@ async function procesarChat(usuario, mensaje, res, imagenBase64, imagenTipo) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica qué ya fue registrado hoy — no preguntes por algo que ya está registrado. Si el mensaje tiene múltiples registros, acusá recibo brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica qué ya fue registrado hoy — nunca preguntes por algo que ya está ahí. Si el mensaje tiene múltiples registros, acusá recibo brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
       .reverse()
       .map(h => ({ role: h.rol, content: h.mensaje }));
 
-    mensajesPrevios.push({ role: 'user', content: mensaje || '[imagen]' });
+    mensajesPrevios.push({ role: 'user', content: mensaje || '[imágenes]' });
 
     if (!esMensajeSistema) {
+      const mensajeGuardado = tieneImagenes
+        ? '[imagen' + (imagenes.length > 1 ? 'es' : '') + ']' + (mensaje ? ': ' + mensaje : '')
+        : mensaje;
       await supabase.from('conversaciones').insert([{
         usuario_id: user.id,
         rol: 'user',
-        mensaje: tieneImagen ? '[imagen]' + (mensaje ? ': ' + mensaje : '') : mensaje
+        mensaje: mensajeGuardado
       }]);
     }
 
     let response;
-    if (tieneImagen) {
-      response = await generarRespuestaConImagen(systemFinal, mensajesPrevios, mensaje, imagenBase64, imagenTipo);
+    if (tieneImagenes) {
+      response = await generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes);
     } else {
       response = await anthropic.messages.create({
         model: 'claude-sonnet-4-5',
@@ -671,15 +663,17 @@ async function procesarChat(usuario, mensaje, res, imagenBase64, imagenTipo) {
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
-  await procesarChat(usuario, mensaje, res, null, null);
+  await procesarChat(usuario, mensaje, res, null);
 });
 
 app.post('/chat', async (req, res) => {
-  const { usuario, mensaje, imagen_base64, imagen_tipo } = req.body;
-  if (!usuario || (!mensaje && !imagen_base64)) {
-    return res.status(400).json({ error: 'Faltan usuario y mensaje o imagen' });
+  const { usuario, mensaje, imagenes } = req.body;
+  if (!usuario || (!mensaje && (!imagenes || imagenes.length === 0))) {
+    return res.status(400).json({ error: 'Faltan usuario y mensaje o imágenes' });
   }
-  await procesarChat(usuario, mensaje || '', res, imagen_base64, imagen_tipo);
+  // Validar máximo 5 imágenes
+  const imagenesValidadas = imagenes ? imagenes.slice(0, 5) : null;
+  await procesarChat(usuario, mensaje || '', res, imagenesValidadas);
 });
 
 app.get('/checkin/:usuario', async (req, res) => {
