@@ -4,7 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -39,9 +40,10 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje empieza con "APERTURA_DIA:": es la primera vez que el usuario abre la app hoy. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y el contexto reciente. Sin excepción.
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y el contexto reciente. Sin excepción.
 - Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante del momento actual.
-- Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas.`;
+- Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas.
+- Si recibís una imagen: describí brevemente lo que ves en términos de salud (comida, datos del reloj, análisis, etc.) y acusá recibo de los datos que pudiste extraer. Sé específico con lo que ves.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -80,16 +82,17 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
 
 Reglas estrictas:
 - Si no hay ningún dato de salud registrable: devolvé {"registros": []}
-- Mensajes que empiezan con "APERTURA_DIA:" y el mensaje "reapertura_del_dia" no son registros de salud. Devolvé {"registros": []}
-- Cada objeto del array representa un evento de salud distinto
+- Mensajes que empiezan con "APERTURA_DIA:" y el mensaje "reapertura_del_dia" no son registros. Devolvé {"registros": []}
+- Cada objeto representa un evento de salud distinto
 - Puede haber más de un objeto del mismo tipo si son momentos distintos
-- No duplicar el mismo evento dentro del mismo mensaje
-- Todos los campos deben estar presentes en cada objeto. Los que no aplican van en null
+- No duplicar el mismo evento
+- Todos los campos presentes en cada objeto. Los que no aplican van en null
 - Nunca texto donde corresponde número
 - energia siempre 1-5 o null
 - tipo_registro solo puede ser uno de los valores listados
 - entreno_tipo y comida_momento solo pueden ser los valores listados exactos
-- nota_libre siempre en tercera persona`;
+- nota_libre siempre en tercera persona
+- Si recibís una imagen: extraé todos los datos de salud visibles (comida, métricas del reloj, análisis de sangre, etc.) con el mismo formato`;
 
 const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
 const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
@@ -129,13 +132,36 @@ function validarRegistro(obj) {
   };
 }
 
-async function extraerRegistros(mensaje) {
+async function extraerRegistros(mensaje, imagenBase64, imagenTipo) {
   try {
+    let contenidoUsuario;
+
+    if (imagenBase64 && imagenTipo) {
+      // Mensaje con imagen
+      contenidoUsuario = [
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: imagenTipo,
+            data: imagenBase64
+          }
+        }
+      ];
+      if (mensaje && mensaje.trim()) {
+        contenidoUsuario.push({ type: 'text', text: mensaje });
+      } else {
+        contenidoUsuario.push({ type: 'text', text: 'Extraé los datos de salud de esta imagen.' });
+      }
+    } else {
+      contenidoUsuario = mensaje;
+    }
+
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 2000,
       system: SABI_EXTRACTOR,
-      messages: [{ role: 'user', content: mensaje }]
+      messages: [{ role: 'user', content: contenidoUsuario }]
     });
 
     let texto = response.content[0].text.trim();
@@ -158,7 +184,7 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
     const { error } = await supabase.from('registros').insert([{
       usuario_id: usuarioId,
       tipo_registro: registro.tipo_registro,
-      mensaje_original: mensaje,
+      mensaje_original: mensaje || '[imagen]',
       origen: 'chat',
       energia: registro.energia,
       nota_libre: registro.nota_libre,
@@ -363,24 +389,18 @@ async function armarContextoReciente(usuarioId) {
 }
 
 function getFechaArgentina() {
-  // Devuelve la fecha de hoy en Argentina como string YYYY-MM-DD
-  const ahora = new Date();
-  const argentinaStr = ahora.toLocaleDateString('en-CA', {
+  return new Date().toLocaleDateString('en-CA', {
     timeZone: 'America/Argentina/Buenos_Aires'
   });
-  return argentinaStr; // formato YYYY-MM-DD
 }
 
 function getInicioHoyArgentina() {
-  // Devuelve el inicio del día de hoy en Argentina como objeto Date UTC
-  const hoyArg = getFechaArgentina(); // YYYY-MM-DD
-  // Medianoche en Argentina = hoyArg T03:00:00Z (UTC-3)
+  const hoyArg = getFechaArgentina();
   return new Date(hoyArg + 'T03:00:00.000Z');
 }
 
 async function armarRegistrosHoy(usuarioId) {
   const inicioHoy = getInicioHoyArgentina();
-
   const { data: registros } = await supabase
     .from('registros')
     .select('tipo_registro, comida_momento, created_at')
@@ -398,11 +418,44 @@ async function armarRegistrosHoy(usuarioId) {
   return `Registrado hoy (${getFechaArgentina()}): ${tipos.join(', ')}.`;
 }
 
+async function generarRespuestaConImagen(systemFinal, mensajesPrevios, mensaje, imagenBase64, imagenTipo) {
+  // Construir el último mensaje con imagen
+  const ultimoMensaje = {
+    role: 'user',
+    content: [
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: imagenTipo,
+          data: imagenBase64
+        }
+      }
+    ]
+  };
+
+  if (mensaje && mensaje.trim()) {
+    ultimoMensaje.content.push({ type: 'text', text: mensaje });
+  } else {
+    ultimoMensaje.content.push({ type: 'text', text: 'Mirá esta imagen y respondé como Sabi.' });
+  }
+
+  // Reemplazar el último mensaje de texto por el mensaje con imagen
+  const mensajesConImagen = [...mensajesPrevios.slice(0, -1), ultimoMensaje];
+
+  return await anthropic.messages.create({
+    model: 'claude-sonnet-4-5',
+    max_tokens: 500,
+    system: systemFinal,
+    messages: mensajesConImagen,
+  });
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.7.2' });
+  res.json({ status: 'Sabi está vivo', version: '2.8.0' });
 });
 
-async function procesarChat(usuario, mensaje, res) {
+async function procesarChat(usuario, mensaje, res, imagenBase64, imagenTipo) {
   try {
     let { data: user } = await supabase
       .from('usuarios')
@@ -440,15 +493,16 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     const enOnboarding = estado.onboarding_stage !== 'completo';
-    const esAperturaDia = mensaje.startsWith('APERTURA_DIA:');
+    const esAperturaDia = mensaje && mensaje.startsWith('APERTURA_DIA:');
     const esReapertura = mensaje === 'reapertura_del_dia';
     const esMensajeSistema = esAperturaDia || esReapertura;
+    const tieneImagen = !!(imagenBase64 && imagenTipo);
 
     let registrosExtraidos = [];
     let cantidadGuardada = 0;
 
     if (!enOnboarding && !esMensajeSistema) {
-      registrosExtraidos = await extraerRegistros(mensaje);
+      registrosExtraidos = await extraerRegistros(mensaje, imagenBase64, imagenTipo);
       cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
     }
 
@@ -460,9 +514,7 @@ async function procesarChat(usuario, mensaje, res) {
       }
     }
 
-    // Apertura del día: sin historial — respuesta limpia sin contexto conversacional previo
     const limiteHistorial = esAperturaDia ? 0 : 20;
-
     const { data: historial } = limiteHistorial > 0 ? await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
@@ -505,7 +557,7 @@ async function procesarChat(usuario, mensaje, res) {
         hour: '2-digit',
         minute: '2-digit'
       });
-      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir correctamente qué pasó hoy, qué pasó ayer, y qué momento del día es ahora. Cualquier evento mencionado como "ayer" o "anoche" es del día anterior a esta fecha.`;
+      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir qué pasó hoy, qué pasó ayer, y qué momento del día es ahora.`;
     }
 
     if (!enOnboarding && user.contexto_base) {
@@ -559,29 +611,34 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica exactamente qué ya fue registrado hoy — no menciones ni preguntes sobre algo que ya está registrado. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día con un mensaje breve y cálido sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día en forma de pregunta breve usando la rutina conocida pero sin asumir. Nunca más de una sugerencia por mensaje. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica qué ya fue registrado hoy — no preguntes por algo que ya está registrado. Si el mensaje tiene múltiples registros, acusá recibo brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
       .reverse()
       .map(h => ({ role: h.rol, content: h.mensaje }));
 
-    mensajesPrevios.push({ role: 'user', content: mensaje });
+    mensajesPrevios.push({ role: 'user', content: mensaje || '[imagen]' });
 
     if (!esMensajeSistema) {
       await supabase.from('conversaciones').insert([{
         usuario_id: user.id,
         rol: 'user',
-        mensaje: mensaje
+        mensaje: tieneImagen ? '[imagen]' + (mensaje ? ': ' + mensaje : '') : mensaje
       }]);
     }
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 500,
-      system: systemFinal,
-      messages: mensajesPrevios,
-    });
+    let response;
+    if (tieneImagen) {
+      response = await generarRespuestaConImagen(systemFinal, mensajesPrevios, mensaje, imagenBase64, imagenTipo);
+    } else {
+      response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 500,
+        system: systemFinal,
+        messages: mensajesPrevios,
+      });
+    }
 
     const respuesta = response.content[0].text;
 
@@ -614,15 +671,15 @@ async function procesarChat(usuario, mensaje, res) {
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
   const { usuario, mensaje } = req.params;
-  await procesarChat(usuario, mensaje, res);
+  await procesarChat(usuario, mensaje, res, null, null);
 });
 
 app.post('/chat', async (req, res) => {
-  const { usuario, mensaje } = req.body;
-  if (!usuario || !mensaje) {
-    return res.status(400).json({ error: 'Faltan usuario o mensaje' });
+  const { usuario, mensaje, imagen_base64, imagen_tipo } = req.body;
+  if (!usuario || (!mensaje && !imagen_base64)) {
+    return res.status(400).json({ error: 'Faltan usuario y mensaje o imagen' });
   }
-  await procesarChat(usuario, mensaje, res);
+  await procesarChat(usuario, mensaje || '', res, imagen_base64, imagen_tipo);
 });
 
 app.get('/checkin/:usuario', async (req, res) => {
