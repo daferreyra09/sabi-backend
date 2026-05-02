@@ -40,7 +40,8 @@ Lo que nunca hacés:
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
 - Si el mensaje es "primera_apertura_del_dia": saludá por nombre y hacé una pregunta concreta del contexto. Ejemplo: "Hola Daniel. ¿Cómo dormiste anoche?" o "Hola Daniel. ¿Ya entrenaste hoy?". Siempre empezá con "Hola [nombre]."
-- Si el mensaje es "reapertura_del_dia": no saludes, preguntá directamente algo relevante del momento del día. Sin hola, sin bienvenido de vuelta.`;
+- Si el mensaje es "reapertura_del_dia": no saludes, preguntá directamente algo relevante del momento del día. Sin hola, sin bienvenido de vuelta.
+- Si el usuario registró la cena o es después de las 21:00 y ya registró las comidas principales del día: cerrá con un mensaje breve y cálido tipo "Buen descanso." o "Buenas noches." Sin abrir nuevas preguntas. No insistas con más registros.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -56,32 +57,39 @@ No respondas al usuario. No saludes. No expliques.
 Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicional, sin markdown, sin backticks.
 
 {
-  "hay_registro": true o false,
-  "tipo_registro": "sueno" | "entrenamiento" | "comida" | "estado" | "sintoma" | "evento" | null,
-  "energia": número 1-5 o null,
-  "nota_libre": "texto corto descriptivo o null",
-  "sueno_calidad": número 1-5 o null,
-  "sueno_duracion_hs": número con decimales o null,
-  "sueno_despertares": número entero o null,
-  "sueno_hora_dormir": "HH:MM" o null,
-  "sueno_hora_despertar": "HH:MM" o null,
-  "entreno_tipo": "fuerza" | "cardio" | "mixto" | "movilidad" | "descanso_activo" | null,
-  "entreno_percepcion": número 1-5 o null,
-  "entreno_ayunas": true | false | null,
-  "comida_momento": "desayuno" | "almuerzo" | "merienda" | "cena" | "snack" | null,
-  "comida_descripcion": "texto corto o null",
-  "sintoma_tipo": "texto corto o null",
-  "sintoma_intensidad": número 1-5 o null
+  "registros": [
+    {
+      "tipo_registro": "sueno" | "entrenamiento" | "comida" | "estado" | "sintoma" | "evento",
+      "energia": número 1-5 o null,
+      "nota_libre": "texto corto descriptivo en tercera persona o null",
+      "sueno_calidad": número 1-5 o null,
+      "sueno_duracion_hs": número con decimales o null,
+      "sueno_despertares": número entero o null,
+      "sueno_hora_dormir": "HH:MM" o null,
+      "sueno_hora_despertar": "HH:MM" o null,
+      "entreno_tipo": "fuerza" | "cardio" | "mixto" | "movilidad" | "descanso_activo" | null,
+      "entreno_percepcion": número 1-5 o null,
+      "entreno_ayunas": true | false | null,
+      "comida_momento": "desayuno" | "almuerzo" | "merienda" | "cena" | "snack" | null,
+      "comida_descripcion": "texto corto o null",
+      "sintoma_tipo": "texto corto o null",
+      "sintoma_intensidad": número 1-5 o null
+    }
+  ]
 }
 
 Reglas estrictas:
-- Si el mensaje no contiene ningún dato de salud registrable, devolvé hay_registro: false y todo lo demás null.
-- Los mensajes "primera_apertura_del_dia" y "reapertura_del_dia" son mensajes del sistema, no registros de salud. Devolvé hay_registro: false.
-- Nunca inventes datos. Si no está en el mensaje, es null.
-- energia siempre 1-5 o null. Nunca texto.
-- tipo_registro solo puede ser uno de los valores listados.
-- entreno_tipo y comida_momento solo pueden ser los valores listados exactos.
-- nota_libre es un resumen breve de lo que dijo el usuario, siempre en tercera persona.`;
+- Si no hay ningún dato de salud registrable: devolvé {"registros": []}
+- Los mensajes "primera_apertura_del_dia" y "reapertura_del_dia" no son registros de salud. Devolvé {"registros": []}
+- Cada objeto del array representa un evento de salud distinto
+- Puede haber más de un objeto del mismo tipo si son momentos distintos. Ejemplo: almuerzo y cena son dos objetos tipo "comida"
+- No duplicar el mismo evento dentro del mismo mensaje
+- Todos los campos deben estar presentes en cada objeto. Los que no aplican van en null
+- Nunca texto donde corresponde número
+- energia siempre 1-5 o null
+- tipo_registro solo puede ser uno de los valores listados
+- entreno_tipo y comida_momento solo pueden ser los valores listados exactos
+- nota_libre siempre en tercera persona`;
 
 const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
 const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
@@ -99,32 +107,34 @@ function validarEnum(valor, permitidos) {
   return valor;
 }
 
-function validarExtraccion(json) {
+function validarRegistro(obj) {
+  const tipo = validarEnum(obj.tipo_registro, TIPOS_REGISTRO_VALIDOS);
+  if (!tipo) return null;
+
   return {
-    hay_registro: json.hay_registro === true,
-    tipo_registro: validarEnum(json.tipo_registro, TIPOS_REGISTRO_VALIDOS),
-    energia: validarRango(json.energia, 1, 5),
-    nota_libre: typeof json.nota_libre === 'string' ? json.nota_libre.slice(0, 300) : null,
-    sueno_calidad: validarRango(json.sueno_calidad, 1, 5),
-    sueno_duracion_hs: validarRango(json.sueno_duracion_hs, 0, 24),
-    sueno_despertares: validarRango(json.sueno_despertares, 0, 20),
-    sueno_hora_dormir: typeof json.sueno_hora_dormir === 'string' ? json.sueno_hora_dormir : null,
-    sueno_hora_despertar: typeof json.sueno_hora_despertar === 'string' ? json.sueno_hora_despertar : null,
-    entreno_tipo: validarEnum(json.entreno_tipo, TIPOS_ENTRENO_VALIDOS),
-    entreno_percepcion: validarRango(json.entreno_percepcion, 1, 5),
-    entreno_ayunas: typeof json.entreno_ayunas === 'boolean' ? json.entreno_ayunas : null,
-    comida_momento: validarEnum(json.comida_momento, MOMENTOS_COMIDA_VALIDOS),
-    comida_descripcion: typeof json.comida_descripcion === 'string' ? json.comida_descripcion.slice(0, 500) : null,
-    sintoma_tipo: typeof json.sintoma_tipo === 'string' ? json.sintoma_tipo.slice(0, 200) : null,
-    sintoma_intensidad: validarRango(json.sintoma_intensidad, 1, 5)
+    tipo_registro: tipo,
+    energia: validarRango(obj.energia, 1, 5),
+    nota_libre: typeof obj.nota_libre === 'string' ? obj.nota_libre.slice(0, 300) : null,
+    sueno_calidad: validarRango(obj.sueno_calidad, 1, 5),
+    sueno_duracion_hs: validarRango(obj.sueno_duracion_hs, 0, 24),
+    sueno_despertares: validarRango(obj.sueno_despertares, 0, 20),
+    sueno_hora_dormir: typeof obj.sueno_hora_dormir === 'string' ? obj.sueno_hora_dormir : null,
+    sueno_hora_despertar: typeof obj.sueno_hora_despertar === 'string' ? obj.sueno_hora_despertar : null,
+    entreno_tipo: validarEnum(obj.entreno_tipo, TIPOS_ENTRENO_VALIDOS),
+    entreno_percepcion: validarRango(obj.entreno_percepcion, 1, 5),
+    entreno_ayunas: typeof obj.entreno_ayunas === 'boolean' ? obj.entreno_ayunas : null,
+    comida_momento: validarEnum(obj.comida_momento, MOMENTOS_COMIDA_VALIDOS),
+    comida_descripcion: typeof obj.comida_descripcion === 'string' ? obj.comida_descripcion.slice(0, 500) : null,
+    sintoma_tipo: typeof obj.sintoma_tipo === 'string' ? obj.sintoma_tipo.slice(0, 200) : null,
+    sintoma_intensidad: validarRango(obj.sintoma_intensidad, 1, 5)
   };
 }
 
-async function extraerRegistro(mensaje) {
+async function extraerRegistros(mensaje) {
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 300,
+      max_tokens: 800,
       system: SABI_EXTRACTOR,
       messages: [{ role: 'user', content: mensaje }]
     });
@@ -133,49 +143,56 @@ async function extraerRegistro(mensaje) {
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
 
     const json = JSON.parse(texto);
-    return validarExtraccion(json);
+
+    if (!Array.isArray(json.registros)) return [];
+
+    const validados = json.registros
+      .map(r => validarRegistro(r))
+      .filter(r => r !== null);
+
+    return validados;
 
   } catch (error) {
     console.error('Error al extraer:', error.message);
-    return { hay_registro: false };
+    return [];
   }
 }
 
-async function guardarRegistro(usuarioId, mensaje, extraccion) {
-  if (!extraccion.hay_registro || !extraccion.tipo_registro) {
-    if (extraccion.hay_registro && !extraccion.tipo_registro) {
-      console.warn('Advertencia: hay_registro true pero tipo_registro null — no se guarda');
+async function guardarRegistros(usuarioId, mensaje, registros) {
+  if (!registros || registros.length === 0) return 0;
+
+  let guardados = 0;
+
+  for (const registro of registros) {
+    const { error } = await supabase.from('registros').insert([{
+      usuario_id: usuarioId,
+      tipo_registro: registro.tipo_registro,
+      mensaje_original: mensaje,
+      origen: 'chat',
+      energia: registro.energia,
+      nota_libre: registro.nota_libre,
+      sueno_calidad: registro.sueno_calidad,
+      sueno_duracion_hs: registro.sueno_duracion_hs,
+      sueno_despertares: registro.sueno_despertares,
+      sueno_hora_dormir: registro.sueno_hora_dormir,
+      sueno_hora_despertar: registro.sueno_hora_despertar,
+      entreno_tipo: registro.entreno_tipo,
+      entreno_percepcion: registro.entreno_percepcion,
+      entreno_ayunas: registro.entreno_ayunas,
+      comida_momento: registro.comida_momento,
+      comida_descripcion: registro.comida_descripcion,
+      sintoma_tipo: registro.sintoma_tipo,
+      sintoma_intensidad: registro.sintoma_intensidad
+    }]);
+
+    if (error) {
+      console.error(`Error guardando registro ${registro.tipo_registro}:`, error.message);
+    } else {
+      guardados++;
     }
-    return false;
   }
 
-  const { error } = await supabase.from('registros').insert([{
-    usuario_id: usuarioId,
-    tipo_registro: extraccion.tipo_registro,
-    mensaje_original: mensaje,
-    origen: 'chat',
-    energia: extraccion.energia,
-    nota_libre: extraccion.nota_libre,
-    sueno_calidad: extraccion.sueno_calidad,
-    sueno_duracion_hs: extraccion.sueno_duracion_hs,
-    sueno_despertares: extraccion.sueno_despertares,
-    sueno_hora_dormir: extraccion.sueno_hora_dormir,
-    sueno_hora_despertar: extraccion.sueno_hora_despertar,
-    entreno_tipo: extraccion.entreno_tipo,
-    entreno_percepcion: extraccion.entreno_percepcion,
-    entreno_ayunas: extraccion.entreno_ayunas,
-    comida_momento: extraccion.comida_momento,
-    comida_descripcion: extraccion.comida_descripcion,
-    sintoma_tipo: extraccion.sintoma_tipo,
-    sintoma_intensidad: extraccion.sintoma_intensidad
-  }]);
-
-  if (error) {
-    console.error('Error guardando registro:', error.message);
-    return false;
-  }
-
-  return true;
+  return guardados;
 }
 
 async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
@@ -381,7 +398,7 @@ async function armarContextoReciente(usuarioId) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.6.2' });
+  res.json({ status: 'Sabi está vivo', version: '2.7.0' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -424,15 +441,15 @@ async function procesarChat(usuario, mensaje, res) {
     const enOnboarding = estado.onboarding_stage !== 'completo';
     const esMensajeSistema = ['primera_apertura_del_dia', 'reapertura_del_dia'].includes(mensaje);
 
-    let extraccion = { hay_registro: false };
-    let registroGuardado = false;
+    let registrosExtraidos = [];
+    let cantidadGuardada = 0;
 
     if (!enOnboarding && !esMensajeSistema) {
-      extraccion = await extraerRegistro(mensaje);
-      registroGuardado = await guardarRegistro(user.id, mensaje, extraccion);
+      registrosExtraidos = await extraerRegistros(mensaje);
+      cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
     }
 
-    if (registroGuardado) {
+    if (cantidadGuardada > 0) {
       try {
         await evaluarSenales(user.id);
       } catch (error) {
@@ -506,8 +523,8 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\n${contextoReciente}`;
     }
 
-    if (!enOnboarding && extraccion.hay_registro) {
-      systemFinal += `\n\nDATO REGISTRADO EN ESTE MENSAJE: ${JSON.stringify(extraccion)}`;
+    if (!enOnboarding && registrosExtraidos.length > 0) {
+      systemFinal += `\n\nDATOS REGISTRADOS EN ESTE MENSAJE (${registrosExtraidos.length} registro/s):\n${JSON.stringify(registrosExtraidos, null, 2)}`;
     }
 
     if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
@@ -528,7 +545,7 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y el DATO REGISTRADO EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Si el perfil dice que el sueño suele ser bueno pero el contexto reciente muestra sueño bajo, respondé desde los datos recientes. Usá el contexto reciente solo si es relevante para responder. No lo menciones completo ni hagas resumen salvo que el usuario lo pida explícitamente. Si el mensaje es solo un registro, respondé breve — máximo 2 líneas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si registró la cena, no abrís nada más — solo cerrás el día. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Si el perfil dice que el sueño suele ser bueno pero el contexto reciente muestra sueño bajo, respondé desde los datos recientes. Usá el contexto reciente solo si es relevante. No lo menciones completo ni hagas resumen salvo que el usuario lo pida. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si el usuario registró la cena o ya son más de las 21:00 y registró las comidas principales, cerrá el día con un mensaje breve y cálido — sin abrir nuevas preguntas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
     }
 
     const mensajesPrevios = (historial || [])
@@ -571,7 +588,7 @@ async function procesarChat(usuario, mensaje, res) {
       onboarding: enOnboarding,
       modo: estado.modo_usuario,
       madurez: estado.madurez_sabi,
-      registro_guardado: registroGuardado,
+      registros_guardados: cantidadGuardada,
       insights_pendientes: insightsPendientes ? insightsPendientes.length : 0
     });
 
