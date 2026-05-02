@@ -39,9 +39,9 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje es "primera_apertura_del_dia": saludá por nombre y hacé una pregunta concreta del contexto. Ejemplo: "Hola Daniel. ¿Cómo dormiste anoche?" o "Hola Daniel. ¿Ya entrenaste hoy?". Siempre empezá con "Hola [nombre]."
-- Si el mensaje es "reapertura_del_dia": no saludes, preguntá directamente algo relevante del momento del día. Sin hola, sin bienvenido de vuelta.
-- Si el usuario registró la cena o es después de las 21:00 y ya registró las comidas principales del día: cerrá con un mensaje breve y cálido tipo "Buen descanso." o "Buenas noches." Sin abrir nuevas preguntas. No insistas con más registros.`;
+- Si el mensaje es "primera_apertura_del_dia": ignorá el historial de conversaciones anteriores para este saludo. Saludá por nombre con "Hola [nombre]." y hacé UNA pregunta concreta basada en el contexto reciente y la hora del día. Ejemplos: mañana → "Hola Daniel. ¿Cómo dormiste anoche?", mediodía → "Hola Daniel. ¿Ya entrenaste hoy?", tarde → "Hola Daniel. ¿Cómo viene la tarde?". Siempre empezá con "Hola [nombre]." — nunca omitás el saludo.
+- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante del momento actual del día, considerando la hora y lo ya registrado hoy.
+- Si el usuario registró la cena o son más de las 21:00 y ya registró las comidas principales: cerrá con un mensaje breve tipo "Buen descanso." o "Buenas noches, Daniel." Sin abrir nuevas preguntas.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -146,11 +146,9 @@ async function extraerRegistros(mensaje) {
 
     if (!Array.isArray(json.registros)) return [];
 
-    const validados = json.registros
+    return json.registros
       .map(r => validarRegistro(r))
       .filter(r => r !== null);
-
-    return validados;
 
   } catch (error) {
     console.error('Error al extraer:', error.message);
@@ -162,7 +160,6 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
   if (!registros || registros.length === 0) return 0;
 
   let guardados = 0;
-
   for (const registro of registros) {
     const { error } = await supabase.from('registros').insert([{
       usuario_id: usuarioId,
@@ -191,7 +188,6 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
       guardados++;
     }
   }
-
   return guardados;
 }
 
@@ -248,28 +244,21 @@ async function evaluarSenales(usuarioId) {
   const registrosSuenoBajo = registros.filter(r =>
     r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
   );
-
   if (registrosSuenoBajo.length >= 3) {
     await crearInsight(usuarioId, 'sueno_recuperacion', 'sueno_bajo_repetido_7d', {
-      dias_analizados: 7,
-      registros_sueno_bajo: registrosSuenoBajo.length,
-      umbral: 2
+      dias_analizados: 7, registros_sueno_bajo: registrosSuenoBajo.length, umbral: 2
     });
   }
 
   const diasConEnergiaBaja = new Set();
   registros.forEach(r => {
     if (r.energia !== null && r.energia <= 2) {
-      const dia = new Date(r.created_at).toISOString().split('T')[0];
-      diasConEnergiaBaja.add(dia);
+      diasConEnergiaBaja.add(new Date(r.created_at).toISOString().split('T')[0]);
     }
   });
-
   if (diasConEnergiaBaja.size >= 3) {
     await crearInsight(usuarioId, 'energia_sostenida', 'energia_baja_repetida_7d', {
-      dias_analizados: 7,
-      dias_con_energia_baja: diasConEnergiaBaja.size,
-      umbral: 2
+      dias_analizados: 7, dias_con_energia_baja: diasConEnergiaBaja.size, umbral: 2
     });
   }
 
@@ -282,31 +271,23 @@ async function evaluarSenales(usuarioId) {
 
   let correlaciones = 0;
   const diasOrdenados = Object.keys(registrosPorDia).sort();
-
   diasOrdenados.forEach((dia, index) => {
     const registrosDia = registrosPorDia[dia];
     const tieneSuenoBajo = registrosDia.some(r =>
       r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
     );
-
     if (tieneSuenoBajo) {
       const diaSiguiente = diasOrdenados[index + 1];
       const registrosDiaSiguiente = diaSiguiente ? registrosPorDia[diaSiguiente] : [];
-
       const energiaBaja = [...registrosDia, ...registrosDiaSiguiente].some(r =>
         r.energia !== null && r.energia <= 2
       );
-
       if (energiaBaja) correlaciones++;
     }
   });
-
   if (correlaciones >= 2) {
     await crearInsight(usuarioId, 'sueno_energia', 'sueno_bajo_energia_baja_7d', {
-      dias_analizados: 7,
-      correlaciones_detectadas: correlaciones,
-      umbral_sueno: 2,
-      umbral_energia: 2
+      dias_analizados: 7, correlaciones_detectadas: correlaciones, umbral_sueno: 2, umbral_energia: 2
     });
   }
 }
@@ -343,12 +324,9 @@ async function armarContextoReciente(usuarioId) {
   registros.forEach(r => {
     if (r.energia !== null) {
       const dia = new Date(r.created_at).toISOString().split('T')[0];
-      if (!diasConEnergia[dia] || r.energia < diasConEnergia[dia]) {
-        diasConEnergia[dia] = r.energia;
-      }
+      if (!diasConEnergia[dia] || r.energia < diasConEnergia[dia]) diasConEnergia[dia] = r.energia;
     }
   });
-
   const valoresEnergia = Object.values(diasConEnergia);
   if (valoresEnergia.length > 0) {
     const promEnergia = (valoresEnergia.reduce((a, b) => a + b, 0) / valoresEnergia.length).toFixed(1);
@@ -397,8 +375,29 @@ async function armarContextoReciente(usuarioId) {
   return contexto;
 }
 
+async function armarRegistrosHoy(usuarioId) {
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+
+  const { data: registros } = await supabase
+    .from('registros')
+    .select('tipo_registro, comida_momento, created_at')
+    .eq('usuario_id', usuarioId)
+    .gte('created_at', hoy.toISOString())
+    .order('created_at', { ascending: true });
+
+  if (!registros || registros.length === 0) return 'Hoy no hay registros todavía.';
+
+  const tipos = registros.map(r => {
+    if (r.tipo_registro === 'comida') return r.comida_momento || 'comida';
+    return r.tipo_registro;
+  });
+
+  return `Registrado hoy: ${tipos.join(', ')}.`;
+}
+
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '2.7.0' });
+  res.json({ status: 'Sabi está vivo', version: '2.7.1' });
 });
 
 async function procesarChat(usuario, mensaje, res) {
@@ -457,12 +456,15 @@ async function procesarChat(usuario, mensaje, res) {
       }
     }
 
+    // Para mensajes sistema, traer solo los últimos 5 mensajes — no el historial completo
+    const limiteHistorial = esMensajeSistema ? 5 : 20;
+
     const { data: historial } = await supabase
       .from('conversaciones')
       .select('rol, mensaje, fecha')
       .eq('usuario_id', user.id)
       .order('fecha', { ascending: false })
-      .limit(20);
+      .limit(limiteHistorial);
 
     const hoy = new Date();
     const en365dias = new Date();
@@ -485,17 +487,23 @@ async function procesarChat(usuario, mensaje, res) {
       .limit(3);
 
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
+    const registrosHoy = !enOnboarding ? await armarRegistrosHoy(user.id) : null;
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
     if (!enOnboarding) {
-      const horaActual = new Date().toLocaleString('es-AR', {
+      // Fecha y hora completa con día de la semana y fecha para que distinga ayer de hoy
+      const ahora = new Date();
+      const fechaCompleta = ahora.toLocaleString('es-AR', {
         timeZone: 'America/Argentina/Buenos_Aires',
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
         hour: '2-digit',
-        minute: '2-digit',
-        weekday: 'long'
+        minute: '2-digit'
       });
-      systemFinal += `\n\nCONTEXTO TEMPORAL: Hoy es ${horaActual} (hora Argentina). Usá esto para calibrar qué momento del día es y qué registro tiene sentido sugerir a continuación.`;
+      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir correctamente qué pasó hoy, qué pasó ayer, y qué momento del día es ahora. Cualquier mensaje que hable de "ayer" o "anoche" se refiere al día anterior a esta fecha.`;
     }
 
     if (!enOnboarding && user.contexto_base) {
@@ -523,12 +531,16 @@ async function procesarChat(usuario, mensaje, res) {
       systemFinal += `\n\n${contextoReciente}`;
     }
 
+    if (!enOnboarding && registrosHoy) {
+      systemFinal += `\n\nREGISTROS DE HOY: ${registrosHoy}`;
+    }
+
     if (!enOnboarding && registrosExtraidos.length > 0) {
       systemFinal += `\n\nDATOS REGISTRADOS EN ESTE MENSAJE (${registrosExtraidos.length} registro/s):\n${JSON.stringify(registrosExtraidos, null, 2)}`;
     }
 
     if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
-      systemFinal += '\n\nSEÑALES DETECTADAS (para tu conocimiento — mencioná solo si es relevante y natural):\n';
+      systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural):\n';
       insightsPendientes.forEach(i => {
         systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
@@ -545,7 +557,7 @@ async function procesarChat(usuario, mensaje, res) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO cuando hablen del estado actual. Si el perfil dice que el sueño suele ser bueno pero el contexto reciente muestra sueño bajo, respondé desde los datos recientes. Usá el contexto reciente solo si es relevante. No lo menciones completo ni hagas resumen salvo que el usuario lo pida. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si el usuario registró la cena o ya son más de las 21:00 y registró las comidas principales, cerrá el día con un mensaje breve y cálido — sin abrir nuevas preguntas. Después de acusar recibo de un registro, podés sugerir el próximo momento lógico del día en forma de pregunta breve, usando la rutina conocida del usuario como referencia pero sin asumir que la va a cumplir. No sugerís algo que ya registró hoy. Si es adulto mayor, no anticipes actividad física — preguntá cómo estuvo el cuerpo o cómo descansó. Nunca más de una sugerencia por mensaje.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. Usá REGISTROS DE HOY para saber qué ya registró hoy y no repetir sugerencias. Si el mensaje tiene múltiples registros, acusá recibo de todos brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día con un mensaje breve y cálido sin abrir nuevas preguntas. Después de acusar recibo, podés sugerir el próximo momento lógico del día en forma de pregunta breve usando la rutina conocida pero sin asumir. Nunca más de una sugerencia por mensaje. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
