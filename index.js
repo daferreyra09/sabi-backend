@@ -134,7 +134,7 @@ async function extraerRegistros(mensaje) {
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 800,
+      max_tokens: 2000,
       system: SABI_EXTRACTOR,
       messages: [{ role: 'user', content: mensaje }]
     });
