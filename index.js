@@ -42,9 +42,9 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y los REGISTROS DE HOY. Lógica de horario: antes de las 13:00 → sueño o entrenamiento; 13:00-16:00 → almuerzo o energía; 16:00-20:00 → merienda o entrenamiento tarde; después de las 20:00 → cena o cierre. Nunca preguntes por algo que ya figura en REGISTROS DE HOY.
-- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá algo relevante según la hora actual y lo que falta registrar hoy según REGISTROS DE HOY. Usá la misma lógica de horario: antes de las 13:00 → sueño o entrenamiento de la mañana, nunca almuerzo; 13:00-16:00 → almuerzo o energía; 16:00-20:00 → merienda o entrenamiento tarde; después de las 20:00 → cena o cierre.
-- Si el usuario registró la cena (comida_momento = cena) O son más de las 21:00 Y ya registró almuerzo Y ya registró cena: cerrá con "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas. Registrar merienda, snack o entrenamiento NO es señal de cierre.
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el ESTADO DEL DÍA. Usá el campo "Próximo momento lógico" del ESTADO DEL DÍA para elegir qué preguntar — nunca preguntes por algo ya registrado. Si el próximo momento está a más de 2 horas, preguntá por sueño o cómo amaneció en vez de anticipar comidas.
+- Si el mensaje es "reapertura_del_dia": no saludes. Usá el ESTADO DEL DÍA para elegir qué preguntar — solo el próximo momento lógico si está cerca. Si no hay nada próximo, cerrá con algo cálido y breve sin pregunta.
+- Si el ESTADO DEL DÍA indica "Día cerrado: sí": cerrá con "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas bajo ninguna circunstancia.
 - Si recibís imágenes: describí lo que ves en términos de salud y acusá recibo de los datos extraídos.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
@@ -510,7 +510,7 @@ function getInicioMananaArgentina() {
   return manana;
 }
 
-async function armarRegistrosHoy(usuarioId) {
+async function armarEstadoDia(usuarioId) {
   const inicioHoy = getInicioHoyArgentina();
   const inicioManana = getInicioMananaArgentina();
 
@@ -519,22 +519,73 @@ async function armarRegistrosHoy(usuarioId) {
     .select('tipo_registro, comida_momento, fecha_evento, created_at')
     .eq('usuario_id', usuarioId);
 
-  if (!todos || todos.length === 0) return 'Hoy no hay registros todavía.';
-
-  // Filtrar por fecha_evento || created_at dentro del día de hoy en Argentina
-  const registrosHoy = todos.filter(r => {
+  // Filtrar registros de hoy por fecha real
+  const registrosHoy = (todos || []).filter(r => {
     const fechaRef = new Date(r.fecha_evento || r.created_at);
     return fechaRef >= inicioHoy && fechaRef < inicioManana;
   });
 
-  if (registrosHoy.length === 0) return 'Hoy no hay registros todavía.';
+  // Flags de qué se registró hoy
+  const sueno = registrosHoy.some(r => r.tipo_registro === 'sueno');
+  const entrenamiento = registrosHoy.some(r => r.tipo_registro === 'entrenamiento');
+  const almuerzo = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'almuerzo');
+  const merienda = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'merienda');
+  const cena = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'cena');
+  const energia = registrosHoy.some(r => r.tipo_registro === 'estado');
+  const sintomas = registrosHoy.some(r => r.tipo_registro === 'sintoma');
 
-  const tipos = registrosHoy.map(r => {
-    if (r.tipo_registro === 'comida') return r.comida_momento || 'comida';
-    return r.tipo_registro;
-  });
+  // Hora actual en Argentina (0-23)
+  const horaActual = parseInt(new Date().toLocaleString('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    hour: '2-digit',
+    hour12: false
+  }).split(':')[0], 10);
 
-  return `Registrado hoy (${getFechaArgentina()}): ${tipos.join(', ')}.`;
+  // Día cerrado si tiene cena registrada
+  const diaCerrado = cena;
+
+  // Calcular próximo momento lógico según hora y huecos reales
+  let proximoMomento = null;
+  if (!diaCerrado) {
+    if (horaActual >= 21) {
+      proximoMomento = cena ? null : 'cena';
+    } else if (horaActual >= 16) {
+      if (!merienda) proximoMomento = 'merienda';
+      else if (!cena) proximoMomento = 'cena';
+    } else if (horaActual >= 13) {
+      if (!almuerzo) proximoMomento = 'almuerzo';
+      else if (!energia) proximoMomento = 'energia';
+    } else {
+      // Antes de las 13 — preguntar por sueño o entrenamiento, nunca comida
+      if (!sueno) proximoMomento = 'sueno';
+      else if (!entrenamiento) proximoMomento = 'entrenamiento';
+    }
+  }
+
+  // Último registro del día
+  const ultimoRegistro = registrosHoy.length > 0
+    ? registrosHoy[registrosHoy.length - 1]
+    : null;
+  const ultimoTipo = ultimoRegistro
+    ? (ultimoRegistro.tipo_registro === 'comida' ? ultimoRegistro.comida_momento : ultimoRegistro.tipo_registro)
+    : null;
+
+  // Armar texto estructurado para el prompt
+  const fecha = getFechaArgentina();
+  let estadoTexto = `ESTADO DEL DÍA (${fecha}):\n`;
+  estadoTexto += `Sueño registrado: ${sueno ? 'sí' : 'no'}\n`;
+  estadoTexto += `Entrenamiento registrado: ${entrenamiento ? 'sí' : 'no'}\n`;
+  estadoTexto += `Almuerzo registrado: ${almuerzo ? 'sí' : 'no'}\n`;
+  estadoTexto += `Merienda registrada: ${merienda ? 'sí' : 'no'}\n`;
+  estadoTexto += `Cena registrada: ${cena ? 'sí' : 'no'}\n`;
+  estadoTexto += `Energía/estado registrado: ${energia ? 'sí' : 'no'}\n`;
+  estadoTexto += `Síntomas registrados: ${sintomas ? 'sí' : 'no'}\n`;
+  if (ultimoTipo) estadoTexto += `Último registro: ${ultimoTipo}\n`;
+  estadoTexto += `Día cerrado: ${diaCerrado ? 'sí' : 'no'}\n`;
+  estadoTexto += `Próximo momento lógico: ${proximoMomento || 'ninguno — día completo o sin hueco relevante'}\n`;
+  estadoTexto += `\nREGLA: Solo preguntá por el próximo momento lógico si está a menos de 2 horas. Si no hay próximo momento o está lejos, cerrá con algo cálido y breve — sin pregunta. Si el día está cerrado (cena registrada), no abras nuevas preguntas.`;
+
+  return estadoTexto;
 }
 
 // ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
@@ -684,7 +735,7 @@ Estructura en prosa continua:
 // ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.1.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.2.0' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -786,7 +837,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       .limit(3);
 
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
-    const registrosHoy = !enOnboarding ? await armarRegistrosHoy(user.id) : null;
+    const estadoDia = !enOnboarding ? await armarEstadoDia(user.id) : null;
 
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
@@ -824,8 +875,8 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       systemFinal += `\n\n${contextoReciente}`;
     }
 
-    if (!enOnboarding && registrosHoy) {
-      systemFinal += `\n\nREGISTROS DE HOY: ${registrosHoy}`;
+    if (!enOnboarding && estadoDia) {
+      systemFinal += `\n\n${estadoDia}`;
     }
 
     if (!enOnboarding && registrosExtraidos.length > 0) {
@@ -854,7 +905,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: REGISTROS DE HOY tiene prioridad absoluta para saber qué ya pasó hoy. Nunca preguntes por algo que ya figura ahí. Si hay múltiples registros nuevos, acusá recibo brevemente en una sola respuesta. Después de acusar recibo, si el próximo momento lógico del día está cerca (menos de 2 horas), podés preguntarlo brevemente. Si está lejos o no hay nada próximo, cerrá con algo cálido y corto — una sola oración, sin pregunta. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El ESTADO DEL DÍA tiene prioridad absoluta para saber qué ya pasó hoy y qué sigue. Nunca preguntes por algo que ya figura como registrado. Usá el campo "Próximo momento lógico" — si dice "ninguno", no abras preguntas. Si hay múltiples registros nuevos, acusá recibo brevemente. Si el día está cerrado, cerrá sin excepciones. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
