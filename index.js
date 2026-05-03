@@ -191,7 +191,13 @@ async function extraerRegistros(mensaje, imagenes) {
         text: mensaje && mensaje.trim() ? mensaje : 'Extraé los datos de salud de estas imágenes.'
       });
     } else {
-      contenidoUsuario = mensaje;
+      // Agregar contexto temporal para que el extractor pueda calcular fechas relativas
+      const fechaCtx = new Date().toLocaleString('es-AR', {
+        timeZone: 'America/Argentina/Buenos_Aires',
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit'
+      });
+      contenidoUsuario = `[Contexto: ahora son las ${fechaCtx} en Argentina]\n\n${mensaje}`;
     }
 
     const response = await anthropic.messages.create({
@@ -848,7 +854,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: REGISTROS DE HOY tiene prioridad absoluta para saber qué ya pasó hoy. Nunca preguntes por algo que ya figura ahí. Si hay múltiples registros nuevos, acusá recibo brevemente en una sola respuesta. Después podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: REGISTROS DE HOY tiene prioridad absoluta para saber qué ya pasó hoy. Nunca preguntes por algo que ya figura ahí. Si hay múltiples registros nuevos, acusá recibo brevemente en una sola respuesta. Después de acusar recibo, si el próximo momento lógico del día está cerca (menos de 2 horas), podés preguntarlo brevemente. Si está lejos o no hay nada próximo, cerrá con algo cálido y corto — una sola oración, sin pregunta. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
