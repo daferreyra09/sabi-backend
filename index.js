@@ -33,7 +33,7 @@ Principios de tono:
 - Calmo, no alarmista — un dato interesante, no una emergencia
 - Breve cuando podés, profundo cuando hace falta
 - Sin emojis — nunca
-- Sin markdown — nunca uses asteriscos, negrita, cursiva ni bullets. Solo texto plano.
+- Sin markdown — NUNCA uses asteriscos, negrita (*texto*), cursiva, bullets con guión, ni ningún tipo de formato. Solo texto plano sin excepción. Esto incluye respuestas sobre hábitos, resúmenes y cualquier otro tipo de mensaje.
 - Con adultos mayores: tono más pausado, más cálido, más simple. Nada técnico sin explicar.
 Lo que nunca hacés:
 - Nunca reemplazás al médico
@@ -200,12 +200,20 @@ async function extraerRegistros(mensaje, imagenes) {
       contenidoUsuario = `[Contexto: ahora son las ${fechaCtx} en Argentina]\n\n${mensaje}`;
     }
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 2000,
-      system: SABI_EXTRACTOR,
-      messages: [{ role: 'user', content: contenidoUsuario }]
-    });
+    // Timeout de 25 segundos para evitar que cuelgue con mensajes pesados
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout_extraccion')), 25000)
+    );
+
+    const response = await Promise.race([
+      anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 2000,
+        system: SABI_EXTRACTOR,
+        messages: [{ role: 'user', content: contenidoUsuario }]
+      }),
+      timeoutPromise
+    ]);
 
     let texto = response.content[0].text.trim();
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
@@ -213,12 +221,16 @@ async function extraerRegistros(mensaje, imagenes) {
     if (!Array.isArray(json.registros)) return { registros: [], error: false };
 
     const validados = json.registros
-      .slice(0, 6) // máximo 6 registros por mensaje
+      .slice(0, 6)
       .map(r => validarRegistro(r))
       .filter(r => r !== null);
 
     return { registros: validados, error: false };
   } catch (error) {
+    if (error.message === 'timeout_extraccion') {
+      console.error('Timeout en extracción — mensaje demasiado pesado');
+      return { registros: [], error: true, timeout: true };
+    }
     console.error('Error al extraer:', error.message);
     return { registros: [], error: true };
   }
@@ -902,7 +914,7 @@ async function armarContextoHabitos(usuarioId) {
   habitos.forEach(h => {
     texto += `- ${h.descripcion} (confianza: ${h.confianza})\n`;
   });
-  texto += 'Usá estos hábitos para personalizar observaciones y anticipar comportamientos — no para prescribir.';
+  texto += 'Usá estos hábitos para personalizar observaciones y anticipar comportamientos — no para prescribir. IMPORTANTE: respondé siempre en texto plano, sin asteriscos, sin negrita, sin markdown de ningún tipo.';
   return texto;
 }
 
@@ -1141,7 +1153,7 @@ Onboarding: completado automáticamente`;
 // ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.5.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.5.1' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -1190,9 +1202,10 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     let registrosExtraidos = [];
     let cantidadGuardada = 0;
     let errorExtraccion = false;
+    let resultado = null;
 
     if (!enOnboarding && !esMensajeSistema) {
-      const resultado = await extraerRegistros(mensaje, imagenesValidas);
+      resultado = await extraerRegistros(mensaje, imagenesValidas);
       registrosExtraidos = resultado.registros;
       errorExtraccion = resultado.error;
       cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
@@ -1316,8 +1329,11 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     // Advertencia si el usuario intentó registrar pero no se guardó nada
-    if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || mensaje?.length > 20)) {
-      systemFinal += '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado de este mensaje. Si el usuario intentó registrar algo, no digas "anotado" ni "lo sumo" ni "registrado". Respondé naturalmente sin afirmar que quedó guardado.';
+    if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || (mensaje && mensaje.length > 20))) {
+      const esTimeout = resultado && resultado.timeout;
+      systemFinal += esTimeout
+        ? '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado y no se guardó ningún registro. El mensaje puede haber sido demasiado largo o pesado. Decile al usuario algo como "Recibí tu mensaje pero hubo un problema al procesarlo — ¿podés separarlo en partes más cortas o enviarlo sin imágenes?" Sin decir "anotado" ni "registrado".'
+        : '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado. Si el usuario intentó registrar algo, no digas "anotado", "registrado" ni "lo sumo". Respondé naturalmente sin afirmar que quedó guardado.';
     }
 
     if (!enOnboarding && insightsFiltrados && insightsFiltrados.length > 0) {
