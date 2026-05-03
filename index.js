@@ -732,6 +732,180 @@ Estructura en prosa continua:
   return response.content[0].text;
 }
 
+// ─── HÁBITOS ─────────────────────────────────────────────────────────────────
+
+async function habitoExiste(usuarioId, tipoHabito) {
+  const { data } = await supabase
+    .from('habitos_usuario')
+    .select('id, confianza, evidencia_json')
+    .eq('usuario_id', usuarioId)
+    .eq('tipo_habito', tipoHabito)
+    .eq('estado', 'activo')
+    .limit(1);
+  return data && data.length > 0 ? data[0] : null;
+}
+
+async function upsertHabito(usuarioId, tipoHabito, descripcion, evidencia) {
+  const existente = await habitoExiste(usuarioId, tipoHabito);
+  if (existente) {
+    // Actualizar evidencia y timestamp
+    await supabase
+      .from('habitos_usuario')
+      .update({ evidencia_json: evidencia, ultima_actualizacion: new Date().toISOString() })
+      .eq('id', existente.id);
+  } else {
+    await supabase.from('habitos_usuario').insert([{
+      usuario_id: usuarioId,
+      tipo_habito: tipoHabito,
+      descripcion,
+      confianza: 'tentativo',
+      evidencia_json: evidencia,
+      estado: 'activo'
+    }]);
+    console.log(`Hábito detectado: ${tipoHabito}`);
+  }
+}
+
+async function detectarHabitos(usuarioId) {
+  try {
+    // Traer registros de los últimos 30 días para detección de hábitos
+    const hace30dias = new Date();
+    hace30dias.setDate(hace30dias.getDate() - 30);
+
+    const { data: todos } = await supabase
+      .from('registros')
+      .select('tipo_registro, fecha_evento, created_at, entreno_ayunas, entreno_tipo, comida_momento, sueno_calidad, sueno_duracion_hs, energia, nota_libre')
+      .eq('usuario_id', usuarioId);
+
+    if (!todos || todos.length === 0) return;
+
+    const registros = todos.filter(r => {
+      const fechaRef = new Date(r.fecha_evento || r.created_at);
+      return fechaRef >= hace30dias;
+    });
+
+    if (registros.length < 10) return; // Mínimo de datos para detectar hábitos
+
+    const entrenos = registros.filter(r => r.tipo_registro === 'entrenamiento');
+    const suenos = registros.filter(r => r.tipo_registro === 'sueno');
+    const comidas = registros.filter(r => r.tipo_registro === 'comida');
+
+    // ── HÁBITO: Entrena en ayunas ──────────────────────────────────────────
+    if (entrenos.length >= 5) {
+      const entrenosAyunas = entrenos.filter(r => r.entreno_ayunas === true);
+      const porcentajeAyunas = entrenosAyunas.length / entrenos.length;
+      if (porcentajeAyunas >= 0.6) {
+        await upsertHabito(usuarioId, 'entreno_ayunas_recurrente',
+          `Entrena en ayunas en el ${Math.round(porcentajeAyunas * 100)}% de las sesiones registradas.`,
+          { sesiones_totales: entrenos.length, sesiones_ayunas: entrenosAyunas.length, porcentaje: porcentajeAyunas }
+        );
+      }
+    }
+
+    // ── HÁBITO: Alta adherencia a fuerza ──────────────────────────────────
+    if (entrenos.length >= 5) {
+      const fuerza = entrenos.filter(r => r.entreno_tipo === 'fuerza');
+      if (fuerza.length >= 3) {
+        // Calcular semanas únicas
+        const semanas = new Set(fuerza.map(r => {
+          const d = new Date(r.fecha_evento || r.created_at);
+          const startOfWeek = new Date(d);
+          startOfWeek.setDate(d.getDate() - d.getDay());
+          return startOfWeek.toISOString().split('T')[0];
+        }));
+        if (semanas.size >= 2) {
+          await upsertHabito(usuarioId, 'fuerza_alta_adherencia',
+            `Entrena fuerza de forma consistente — ${fuerza.length} sesiones en las últimas semanas.`,
+            { sesiones_fuerza: fuerza.length, semanas_activas: semanas.size }
+          );
+        }
+      }
+    }
+
+    // ── HÁBITO: Sueño consistente ──────────────────────────────────────────
+    if (suenos.length >= 5) {
+      const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
+      const buenas = calidades.filter(c => c >= 4).length;
+      if (calidades.length >= 5 && buenas / calidades.length >= 0.7) {
+        await upsertHabito(usuarioId, 'sueno_consistente',
+          `El sueño es consistentemente bueno — calidad >= 4 en el ${Math.round(buenas / calidades.length * 100)}% de las noches registradas.`,
+          { noches_registradas: calidades.length, noches_buenas: buenas }
+        );
+      }
+    }
+
+    // ── HÁBITO: Sueño irregular ────────────────────────────────────────────
+    if (suenos.length >= 5) {
+      const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
+      const bajas = calidades.filter(c => c <= 2).length;
+      if (calidades.length >= 5 && bajas / calidades.length >= 0.4) {
+        await upsertHabito(usuarioId, 'sueno_irregular',
+          `El sueño muestra irregularidad frecuente — calidad baja en el ${Math.round(bajas / calidades.length * 100)}% de las noches registradas.`,
+          { noches_registradas: calidades.length, noches_bajas: bajas }
+        );
+      }
+    }
+
+    // ── HÁBITO: Cena tardía recurrente ────────────────────────────────────
+    const cenas = comidas.filter(r => r.comida_momento === 'cena' && r.nota_libre);
+    if (cenas.length >= 3) {
+      const cenasTardias = cenas.filter(r => {
+        const hora = r.nota_libre?.match(/(\d{1,2}):(\d{2})/);
+        if (hora) return parseInt(hora[1]) >= 21;
+        return false;
+      });
+      if (cenasTardias.length / cenas.length >= 0.5) {
+        await upsertHabito(usuarioId, 'cena_tardia_recurrente',
+          `Cena frecuentemente después de las 21hs — en el ${Math.round(cenasTardias.length / cenas.length * 100)}% de los registros.`,
+          { cenas_registradas: cenas.length, cenas_tardias: cenasTardias.length }
+        );
+      }
+    }
+
+    // ── HÁBITO: Energía baja un día específico de la semana ───────────────
+    const registrosEnergia = registros.filter(r => r.energia !== null && r.energia <= 2);
+    if (registrosEnergia.length >= 4) {
+      const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+      const conteoXDia = {};
+      registrosEnergia.forEach(r => {
+        const dia = new Date(r.fecha_evento || r.created_at).getDay();
+        conteoXDia[dia] = (conteoXDia[dia] || 0) + 1;
+      });
+      Object.entries(conteoXDia).forEach(async ([dia, count]) => {
+        if (count >= 2) {
+          await upsertHabito(usuarioId, `energia_baja_${diasSemana[dia]}`,
+            `Energía baja se repite los ${diasSemana[dia]} — detectado ${count} veces en los últimos 30 días.`,
+            { dia_semana: diasSemana[dia], ocurrencias: count }
+          );
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error detectando hábitos:', error.message);
+  }
+}
+
+async function armarContextoHabitos(usuarioId) {
+  const { data: habitos } = await supabase
+    .from('habitos_usuario')
+    .select('tipo_habito, descripcion, confianza, ultima_actualizacion')
+    .eq('usuario_id', usuarioId)
+    .eq('estado', 'activo')
+    .neq('confianza', 'descartado')
+    .order('ultima_actualizacion', { ascending: false })
+    .limit(8);
+
+  if (!habitos || habitos.length === 0) return null;
+
+  let texto = 'HÁBITOS DETECTADOS (patrones consolidados de esta persona):\n';
+  habitos.forEach(h => {
+    texto += `- ${h.descripcion} (confianza: ${h.confianza})\n`;
+  });
+  texto += 'Usá estos hábitos para personalizar observaciones y anticipar comportamientos — no para prescribir.';
+  return texto;
+}
+
 // ─── OBRA SOCIAL ─────────────────────────────────────────────────────────────
 
 // Detecta si el mensaje tiene intención de consulta sobre obra social
@@ -967,7 +1141,7 @@ Onboarding: completado automáticamente`;
 // ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.4.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.5.0' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -1028,6 +1202,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       try {
         await evaluarSenales(user.id);
         await actualizarMadurez(user.id);
+        await detectarHabitos(user.id); // Detectar hábitos después de cada registro
       } catch (error) {
         console.error('Error post-registro:', error.message);
       }
@@ -1062,14 +1237,26 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
 
     const { data: insightsPendientes } = await supabase
       .from('insights')
-      .select('tipo_insight, regla_origen, confianza')
+      .select('id, tipo_insight, regla_origen, confianza, contador_exposiciones')
       .eq('usuario_id', user.id)
       .eq('estado', 'pendiente')
       .order('created_at', { ascending: false })
-      .limit(3);
+      .limit(10);
+
+    // Filtrar insights que no superaron 3 exposiciones y actualizar contador
+    const insightsFiltrados = (insightsPendientes || []).filter(i => (i.contador_exposiciones || 0) < 3);
+    if (insightsFiltrados.length > 0) {
+      for (const insight of insightsFiltrados.slice(0, 3)) {
+        await supabase
+          .from('insights')
+          .update({ contador_exposiciones: (insight.contador_exposiciones || 0) + 1 })
+          .eq('id', insight.id);
+      }
+    }
 
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
     const estadoDia = !enOnboarding ? await armarEstadoDia(user.id) : null;
+    const contextoHabitos = !enOnboarding ? await armarContextoHabitos(user.id) : null;
 
     // Consulta obra social solo si el mensaje lo amerita y el usuario tiene una cargada
     let contextoObraSocial = null;
@@ -1116,6 +1303,10 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       systemFinal += `\n\n${contextoReciente}`;
     }
 
+    if (!enOnboarding && contextoHabitos) {
+      systemFinal += `\n\n${contextoHabitos}`;
+    }
+
     if (!enOnboarding && estadoDia) {
       systemFinal += `\n\n${estadoDia}`;
     }
@@ -1129,9 +1320,9 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       systemFinal += '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado de este mensaje. Si el usuario intentó registrar algo, no digas "anotado" ni "lo sumo" ni "registrado". Respondé naturalmente sin afirmar que quedó guardado.';
     }
 
-    if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
+    if (!enOnboarding && insightsFiltrados && insightsFiltrados.length > 0) {
       systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural):\n';
-      insightsPendientes.forEach(i => {
+      insightsFiltrados.slice(0, 3).forEach(i => {
         systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
     }
@@ -1203,7 +1394,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       modo: estadoFinal.modo_usuario,
       madurez: estadoFinal.madurez_sabi,
       registros_guardados: cantidadGuardada,
-      insights_pendientes: insightsPendientes ? insightsPendientes.length : 0
+      insights_pendientes: insightsFiltrados ? insightsFiltrados.length : 0
     });
 
   } catch (error) {
