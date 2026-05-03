@@ -843,10 +843,131 @@ async function consultarObraSocial(obraSocial) {
   return texto;
 }
 
+// ─── ONBOARDING AUTOMÁTICO ───────────────────────────────────────────────────
+
+// Extrae datos del onboarding del historial de conversaciones
+function extraerDatosOnboarding(historial) {
+  if (!historial || historial.length === 0) return {};
+
+  const texto = historial
+    .map(h => `${h.rol}: ${h.mensaje}`)
+    .join('\n')
+    .toLowerCase();
+
+  const datos = {};
+
+  // Detectar nombre — buscar en respuestas del usuario después de que Sabi preguntó el nombre
+  const mensajesUsuario = historial.filter(h => h.rol === 'user').map(h => h.mensaje);
+
+  // Nombre: primera respuesta corta del usuario (1-3 palabras, no una oración)
+  for (const msg of mensajesUsuario) {
+    const limpio = msg.trim();
+    const palabras = limpio.split(/\s+/);
+    if (palabras.length >= 1 && palabras.length <= 4 && !limpio.includes('?') && !limpio.includes(',')) {
+      // Probable nombre
+      if (!datos.nombre && /^[a-záéíóúüñA-ZÁÉÍÓÚÜÑ\s]+$/.test(limpio)) {
+        datos.nombre = limpio.split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join(' ');
+      }
+    }
+  }
+
+  // Edad: buscar número entre 10 y 110 en mensajes del usuario
+  for (const msg of mensajesUsuario) {
+    const match = msg.match(/\b(\d{2,3})\b/);
+    if (match) {
+      const num = parseInt(match[1]);
+      if (num >= 10 && num <= 110 && !datos.edad) {
+        datos.edad = num;
+      }
+    }
+  }
+
+  // Objetivo: último mensaje largo del usuario (más de 10 palabras) que no sea nombre ni edad
+  for (const msg of [...mensajesUsuario].reverse()) {
+    if (msg.split(/\s+/).length > 6 && !datos.objetivo) {
+      datos.objetivo = msg.trim();
+      break;
+    }
+  }
+
+  return datos;
+}
+
+async function procesarOnboarding(userId, estado, historial, respuestaSabi) {
+  try {
+    const stage = estado.onboarding_stage;
+
+    // Ya completo — no hacer nada
+    if (stage === 'completo') return;
+
+    const datos = extraerDatosOnboarding(historial);
+
+    // Determinar nuevo stage según lo que tenemos
+    let nuevoStage = stage;
+    const updates = {};
+
+    if (stage === 'nuevo' && datos.nombre) {
+      nuevoStage = 'pidio_nombre';
+      updates.nombre = datos.nombre;
+    }
+
+    if ((stage === 'nuevo' || stage === 'pidio_nombre') && datos.nombre && datos.edad) {
+      nuevoStage = 'pidio_edad';
+      updates.nombre = datos.nombre;
+    }
+
+    if (datos.nombre && datos.edad && datos.objetivo) {
+      nuevoStage = 'completo';
+      updates.nombre = datos.nombre;
+      // Detectar si es adulto mayor
+      const modoUsuario = datos.edad >= 65 ? 'adulto_mayor' : 'adulto_activo';
+      // Construir contexto_base básico
+      const contextoBase = `Nombre: ${datos.nombre}
+Edad: ${datos.edad} años
+Objetivo principal: ${datos.objetivo}
+Onboarding: completado automáticamente`;
+
+      // Actualizar usuario
+      await supabase
+        .from('usuarios')
+        .update({ nombre: updates.nombre, contexto_base: contextoBase })
+        .eq('id', userId);
+
+      // Actualizar estado
+      await supabase
+        .from('estado_usuario')
+        .update({ onboarding_stage: 'completo', modo_usuario: modoUsuario })
+        .eq('usuario_id', userId);
+
+      console.log(`Onboarding completo: ${datos.nombre}, ${datos.edad} años, modo: ${modoUsuario}`);
+      return;
+    }
+
+    // Actualizar stage y nombre si cambió
+    if (nuevoStage !== stage) {
+      const updateEstado = { onboarding_stage: nuevoStage };
+      await supabase
+        .from('estado_usuario')
+        .update(updateEstado)
+        .eq('usuario_id', userId);
+
+      if (updates.nombre) {
+        await supabase
+          .from('usuarios')
+          .update({ nombre: updates.nombre })
+          .eq('id', userId);
+      }
+    }
+
+  } catch (error) {
+    console.error('Error procesando onboarding:', error.message);
+  }
+}
+
 // ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.3.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.4.0' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -1063,6 +1184,17 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
 
     await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
     await supabase.from('estado_usuario').update({ ultimo_mensaje_at: new Date().toISOString() }).eq('usuario_id', user.id);
+
+    // Procesar onboarding automático si el usuario todavía no completó
+    if (enOnboarding) {
+      const historialCompleto = await supabase
+        .from('conversaciones')
+        .select('rol, mensaje')
+        .eq('usuario_id', user.id)
+        .order('fecha', { ascending: true })
+        .limit(30);
+      await procesarOnboarding(user.id, estadoFinal, historialCompleto.data || [], respuesta);
+    }
 
     res.json({
       respuesta,
