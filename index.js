@@ -732,10 +732,121 @@ Estructura en prosa continua:
   return response.content[0].text;
 }
 
+// ─── OBRA SOCIAL ─────────────────────────────────────────────────────────────
+
+// Detecta si el mensaje tiene intención de consulta sobre obra social
+function esMensajeObraSocial(mensaje) {
+  if (!mensaje) return false;
+  const keywords = [
+    'cubre', 'cobertura', 'obra social', 'pami', 'osseg', 'osde', 'ioma', 'prepaga',
+    'prestador', 'médico', 'medico', 'especialista', 'farmacia', 'farmac',
+    'turno', 'autorización', 'autorizacion', 'receta', 'medicamento', 'remedios',
+    'laboratorio', 'análisis', 'análisis', 'ecografía', 'estudio', 'tomografía',
+    'oftalmólogo', 'cardiólogo', 'traumatólogo', 'clínica', 'sanatorio',
+    'internación', 'guardia', 'urgencia', 'traslado', 'ambulancia',
+    'óptica', 'anteojos', 'audífono', 'prótesis', 'kinesiología',
+    'porcentaje', 'reintegro', 'plan', 'afiliado', 'cartilla',
+    'quién me atiende', 'donde me atiendo', 'dónde', 'donde'
+  ];
+  const msj = mensaje.toLowerCase();
+  return keywords.some(k => msj.includes(k));
+}
+
+// Extrae el nombre de la obra social del contexto_base del usuario
+function extraerObraSocial(contextoBase) {
+  if (!contextoBase) return null;
+  const ctx = contextoBase.toUpperCase();
+  if (ctx.includes('PAMI')) return 'PAMI';
+  if (ctx.includes('OSSEG')) return 'OSSEG';
+  if (ctx.includes('OSDE')) return 'OSDE';
+  if (ctx.includes('IOMA')) return 'IOMA';
+  if (ctx.includes('MEDICUS')) return 'MEDICUS';
+  if (ctx.includes('SWISS MEDICAL')) return 'SWISS MEDICAL';
+  if (ctx.includes('GALENO')) return 'GALENO';
+  // Patrón genérico: buscar "Obra social: NOMBRE" o "NOMBRE (obra social)"
+  const match = contextoBase.match(/obra social[:\s]+([A-Z][A-Za-z\s]+?)[\n\.,]/i);
+  if (match) return match[1].trim().toUpperCase();
+  return null;
+}
+
+async function consultarObraSocial(obraSocial) {
+  if (!obraSocial) return null;
+
+  const [{ data: prestadores }, { data: cobertura }] = await Promise.all([
+    supabase
+      .from('prestadores_obra_social')
+      .select('tipo, especialidad, nombre, direccion, localidad, telefono, prioridad')
+      .eq('obra_social', obraSocial)
+      .eq('activo', true)
+      .order('prioridad', { ascending: true })
+      .order('localidad', { ascending: true }),
+    supabase
+      .from('cobertura_obra_social')
+      .select('categoria, descripcion, porcentaje, condiciones')
+      .eq('obra_social', obraSocial)
+      .eq('activo', true)
+      .order('categoria', { ascending: true })
+  ]);
+
+  if ((!prestadores || prestadores.length === 0) && (!cobertura || cobertura.length === 0)) {
+    return null;
+  }
+
+  let texto = `INFORMACIÓN DE OBRA SOCIAL (${obraSocial}):\n`;
+
+  if (cobertura && cobertura.length > 0) {
+    texto += '\nCOBERTURAS:\n';
+    cobertura.forEach(c => {
+      texto += `- ${c.descripcion}`;
+      if (c.porcentaje) texto += ` → ${c.porcentaje}`;
+      if (c.condiciones) texto += `. ${c.condiciones}`;
+      texto += '\n';
+    });
+  }
+
+  if (prestadores && prestadores.length > 0) {
+    // Agrupar por tipo
+    const porTipo = {};
+    prestadores.forEach(p => {
+      if (!porTipo[p.tipo]) porTipo[p.tipo] = [];
+      porTipo[p.tipo].push(p);
+    });
+
+    const tiposOrden = ['medico_cabecera', 'clinica', 'laboratorio', 'imagen', 'especialista', 'farmacia', 'optica'];
+    const tiposLabels = {
+      medico_cabecera: 'MÉDICA/O DE CABECERA',
+      clinica: 'CLÍNICAS Y SANATORIOS',
+      laboratorio: 'LABORATORIO',
+      imagen: 'IMÁGENES Y DIAGNÓSTICO',
+      especialista: 'ESPECIALISTAS',
+      farmacia: 'FARMACIAS ADHERIDAS',
+      optica: 'ÓPTICA'
+    };
+
+    texto += '\nPRESTADORES:\n';
+    tiposOrden.forEach(tipo => {
+      if (!porTipo[tipo]) return;
+      texto += `\n${tiposLabels[tipo] || tipo.toUpperCase()}:\n`;
+      porTipo[tipo].forEach(p => {
+        texto += `- ${p.nombre}`;
+        if (p.localidad) texto += ` (${p.localidad})`;
+        if (p.direccion) texto += ` — ${p.direccion}`;
+        if (p.telefono) texto += ` — Tel: ${p.telefono}`;
+        if (p.especialidad && p.tipo !== 'farmacia') texto += ` [${p.especialidad}]`;
+        texto += '\n';
+      });
+    });
+  }
+
+  texto += '\nIMPORTANTE: Usá esta información para responder preguntas de cobertura y prestadores con contexto personal. Nunca inventes datos que no estén acá. Si falta información, decilo honestamente.';
+
+  return texto;
+}
+
 // ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.2.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.3.0' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -839,6 +950,15 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
     const estadoDia = !enOnboarding ? await armarEstadoDia(user.id) : null;
 
+    // Consulta obra social solo si el mensaje lo amerita y el usuario tiene una cargada
+    let contextoObraSocial = null;
+    if (!enOnboarding && !esMensajeSistema && esMensajeObraSocial(mensaje)) {
+      const obraSocial = extraerObraSocial(user.contexto_base);
+      if (obraSocial) {
+        contextoObraSocial = await consultarObraSocial(obraSocial);
+      }
+    }
+
     let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
 
     if (!enOnboarding) {
@@ -893,6 +1013,10 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       insightsPendientes.forEach(i => {
         systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
+    }
+
+    if (!enOnboarding && contextoObraSocial) {
+      systemFinal += `\n\n${contextoObraSocial}`;
     }
 
     if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
