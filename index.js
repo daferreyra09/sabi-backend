@@ -4,8 +4,8 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -17,6 +17,8 @@ app.use((req, res, next) => {
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+// ─── PROMPTS ────────────────────────────────────────────────────────────────
 
 const SABI_SYSTEM = `Sos Sabi, un acompañante personal de salud basado en neurociencia y evidencia científica.
 No sos un médico, no sos un coach, no sos un nutricionista. Sos ese amigo que más sabe — el que tiene memoria de la persona, la acompaña sin juzgar, y le muestra lo que no está viendo solo.
@@ -40,9 +42,9 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y los registros disponibles. Usá esta lógica de horario: antes de las 13:00 → sueño o entrenamiento; entre 13:00 y 16:00 → almuerzo o energía; entre 16:00 y 20:00 → merienda o entrenamiento tarde; después de las 20:00 → cena o cierre. Nunca preguntes por algo que ya está en REGISTROS DE HOY.
-- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá directamente algo relevante según la hora y lo que falta registrar.
-- Si el usuario registró la cena (comida_momento = cena) O son más de las 21:00 Y ya registró almuerzo Y ya registró cena: cerrá con "Buen descanso." o "Buenas noches." Sin abrir nuevas preguntas. En ningún otro caso cierres el día — registrar merienda, snack o entrenamiento no es señal de cierre.
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el momento del día y los REGISTROS DE HOY. Lógica de horario: antes de las 13:00 → sueño o entrenamiento; 13:00-16:00 → almuerzo o energía; 16:00-20:00 → merienda o entrenamiento tarde; después de las 20:00 → cena o cierre. Nunca preguntes por algo que ya figura en REGISTROS DE HOY.
+- Si el mensaje es "reapertura_del_dia": no saludes. Preguntá algo relevante según la hora y lo que falta registrar hoy según REGISTROS DE HOY.
+- Si el usuario registró la cena (comida_momento = cena) O son más de las 21:00 Y ya registró almuerzo Y ya registró cena: cerrá con "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas. Registrar merienda, snack o entrenamiento NO es señal de cierre.
 - Si recibís imágenes: describí lo que ves en términos de salud y acusá recibo de los datos extraídos.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
@@ -62,6 +64,7 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
   "registros": [
     {
       "tipo_registro": "sueno" | "entrenamiento" | "comida" | "estado" | "sintoma" | "evento",
+      "fecha_evento": "YYYY-MM-DDTHH:mm:ss.sssZ" o null,
       "energia": número 1-5 o null,
       "nota_libre": "texto corto descriptivo en tercera persona o null",
       "sueno_calidad": número 1-5 o null,
@@ -80,9 +83,16 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
   ]
 }
 
+Reglas de fecha_evento:
+- Solo completar fecha_evento si hay referencia temporal explícita y clara: "ayer", "anoche", "hoy a la mañana", "el lunes", "el 1 de mayo"
+- Si no hay referencia temporal explícita: fecha_evento = null (el código usa now() como fallback)
+- Nunca inferir fechas de contexto implícito o vago
+- Nunca poner fecha futura
+
 Reglas estrictas:
 - Si no hay ningún dato de salud registrable: devolvé {"registros": []}
 - Mensajes que empiezan con "APERTURA_DIA:" y el mensaje "reapertura_del_dia" no son registros. Devolvé {"registros": []}
+- Máximo 6 registros por mensaje
 - Cada objeto representa un evento de salud distinto
 - Puede haber más de un objeto del mismo tipo si son momentos distintos
 - No duplicar el mismo evento
@@ -94,12 +104,24 @@ Reglas estrictas:
 - nota_libre siempre en tercera persona
 - Si recibís imágenes: extraé todos los datos de salud visibles con el mismo formato`;
 
+const SABI_RESUMEN_SYSTEM = `Sos Sabi. Tu única tarea ahora es generar el resumen semanal de salud de esta persona.
+Sin markdown. Sin emojis. Sin bullets. Solo texto plano en prosa.
+No inventés datos. No diagnosticás. No usés tono médico.
+Si falta información sobre algún pilar, decilo honestamente en lugar de inventar.
+Máximo 250 palabras en total.
+Una sola sugerencia concreta al final — algo que pueda hacer mañana, no un consejo genérico.
+Nunca terminar con "seguí así" sin contexto específico.`;
+
+// ─── VALIDACIÓN ──────────────────────────────────────────────────────────────
+
 const TIPOS_REGISTRO_VALIDOS = ['sueno', 'entrenamiento', 'comida', 'estado', 'sintoma', 'evento'];
 const TIPOS_ENTRENO_VALIDOS = ['fuerza', 'cardio', 'mixto', 'movilidad', 'descanso_activo'];
 const MOMENTOS_COMIDA_VALIDOS = ['desayuno', 'almuerzo', 'merienda', 'cena', 'snack'];
+const REGEX_HORA = /^([01]\d|2[0-3]):[0-5]\d$/;
+const MEDIA_TYPES_VALIDOS = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 
 function validarRango(valor, min, max) {
-  if (valor === null || valor === undefined) return null;
+  if (valor === null || valor === undefined || valor === '' || valor === ' ') return null;
   const num = Number(valor);
   if (isNaN(num) || num < min || num > max) return null;
   return num;
@@ -110,18 +132,37 @@ function validarEnum(valor, permitidos) {
   return valor;
 }
 
+function validarHora(valor) {
+  if (!valor || typeof valor !== 'string') return null;
+  return REGEX_HORA.test(valor.trim()) ? valor.trim() : null;
+}
+
+function validarFechaEvento(valor) {
+  if (!valor) return null;
+  try {
+    const d = new Date(valor);
+    if (isNaN(d.getTime())) return null;
+    // Rechazar fechas futuras absurdas (más de 1 día en el futuro)
+    if (d > new Date(Date.now() + 86400000)) return null;
+    return d.toISOString();
+  } catch {
+    return null;
+  }
+}
+
 function validarRegistro(obj) {
   const tipo = validarEnum(obj.tipo_registro, TIPOS_REGISTRO_VALIDOS);
   if (!tipo) return null;
   return {
     tipo_registro: tipo,
+    fecha_evento: validarFechaEvento(obj.fecha_evento),
     energia: validarRango(obj.energia, 1, 5),
     nota_libre: typeof obj.nota_libre === 'string' ? obj.nota_libre.slice(0, 300) : null,
     sueno_calidad: validarRango(obj.sueno_calidad, 1, 5),
     sueno_duracion_hs: validarRango(obj.sueno_duracion_hs, 0, 24),
     sueno_despertares: validarRango(obj.sueno_despertares, 0, 20),
-    sueno_hora_dormir: typeof obj.sueno_hora_dormir === 'string' ? obj.sueno_hora_dormir : null,
-    sueno_hora_despertar: typeof obj.sueno_hora_despertar === 'string' ? obj.sueno_hora_despertar : null,
+    sueno_hora_dormir: validarHora(obj.sueno_hora_dormir),
+    sueno_hora_despertar: validarHora(obj.sueno_hora_despertar),
     entreno_tipo: validarEnum(obj.entreno_tipo, TIPOS_ENTRENO_VALIDOS),
     entreno_percepcion: validarRango(obj.entreno_percepcion, 1, 5),
     entreno_ayunas: typeof obj.entreno_ayunas === 'boolean' ? obj.entreno_ayunas : null,
@@ -131,6 +172,8 @@ function validarRegistro(obj) {
     sintoma_intensidad: validarRango(obj.sintoma_intensidad, 1, 5)
   };
 }
+
+// ─── EXTRACCIÓN ──────────────────────────────────────────────────────────────
 
 async function extraerRegistros(mensaje, imagenes) {
   try {
@@ -161,21 +204,32 @@ async function extraerRegistros(mensaje, imagenes) {
     let texto = response.content[0].text.trim();
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     const json = JSON.parse(texto);
-    if (!Array.isArray(json.registros)) return [];
-    return json.registros.map(r => validarRegistro(r)).filter(r => r !== null);
+    if (!Array.isArray(json.registros)) return { registros: [], error: false };
+
+    const validados = json.registros
+      .slice(0, 6) // máximo 6 registros por mensaje
+      .map(r => validarRegistro(r))
+      .filter(r => r !== null);
+
+    return { registros: validados, error: false };
   } catch (error) {
     console.error('Error al extraer:', error.message);
-    return [];
+    return { registros: [], error: true };
   }
 }
 
+// ─── PERSISTENCIA ────────────────────────────────────────────────────────────
+
 async function guardarRegistros(usuarioId, mensaje, registros) {
   if (!registros || registros.length === 0) return 0;
+  const ahora = new Date().toISOString();
   let guardados = 0;
   for (const registro of registros) {
     const { error } = await supabase.from('registros').insert([{
       usuario_id: usuarioId,
       tipo_registro: registro.tipo_registro,
+      // fecha_evento: lo que extrajo el modelo, o now() como fallback
+      fecha_evento: registro.fecha_evento || ahora,
       mensaje_original: mensaje || '[imagen]',
       origen: 'chat',
       energia: registro.energia,
@@ -202,19 +256,24 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
   return guardados;
 }
 
-// Calcula y actualiza madurez basada en días con datos y cantidad de registros
+// ─── MADUREZ ─────────────────────────────────────────────────────────────────
+
 async function actualizarMadurez(usuarioId) {
   try {
     const { data: registros } = await supabase
       .from('registros')
-      .select('created_at')
+      .select('fecha_evento, created_at')
       .eq('usuario_id', usuarioId);
 
     if (!registros) return;
 
     const cantidadRegistros = registros.length;
+    // Usar fecha_evento || created_at para calcular días reales con datos
     const diasConDatos = new Set(
-      registros.map(r => new Date(r.created_at).toISOString().split('T')[0])
+      registros.map(r => {
+        const fecha = r.fecha_evento || r.created_at;
+        return new Date(fecha).toISOString().split('T')[0];
+      })
     ).size;
 
     let nuevaMadurez = 'escucha';
@@ -228,17 +287,15 @@ async function actualizarMadurez(usuarioId) {
 
     await supabase
       .from('estado_usuario')
-      .update({
-        madurez_sabi: nuevaMadurez,
-        cantidad_registros: cantidadRegistros,
-        dias_con_datos: diasConDatos
-      })
+      .update({ madurez_sabi: nuevaMadurez, cantidad_registros: cantidadRegistros, dias_con_datos: diasConDatos })
       .eq('usuario_id', usuarioId);
 
   } catch (error) {
     console.error('Error actualizando madurez:', error.message);
   }
 }
+
+// ─── SEÑALES ─────────────────────────────────────────────────────────────────
 
 async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
   const hace14dias = new Date();
@@ -259,33 +316,35 @@ async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
   const existe = await insightExiste(usuarioId, tipoInsight, reglaOrigen);
   if (existe) return;
   const { error } = await supabase.from('insights').insert([{
-    usuario_id: usuarioId,
-    tipo_insight: tipoInsight,
-    regla_origen: reglaOrigen,
-    evidencia_json: evidencia,
-    confianza: 'tentativo',
-    estado: 'pendiente'
+    usuario_id: usuarioId, tipo_insight: tipoInsight, regla_origen: reglaOrigen,
+    evidencia_json: evidencia, confianza: 'tentativo', estado: 'pendiente'
   }]);
-  if (error) {
-    console.error('Error creando insight:', error.message);
-  } else {
-    console.log(`Insight creado: ${tipoInsight} / ${reglaOrigen}`);
-  }
+  if (error) console.error('Error creando insight:', error.message);
+  else console.log(`Insight creado: ${tipoInsight} / ${reglaOrigen}`);
 }
 
 async function evaluarSenales(usuarioId) {
   const hace7dias = new Date();
   hace7dias.setDate(hace7dias.getDate() - 7);
+
   const { data: registros } = await supabase
     .from('registros')
-    .select('tipo_registro, energia, sueno_calidad, created_at')
-    .eq('usuario_id', usuarioId)
-    .gte('created_at', hace7dias.toISOString())
-    .order('created_at', { ascending: true });
+    .select('tipo_registro, energia, sueno_calidad, fecha_evento, created_at')
+    .eq('usuario_id', usuarioId);
 
   if (!registros || registros.length === 0) return;
 
-  const registrosSuenoBajo = registros.filter(r =>
+  // Usar fecha_evento || created_at como fecha real del evento
+  const registrosConFecha = registros.map(r => ({
+    ...r,
+    fecha_ref: new Date(r.fecha_evento || r.created_at)
+  }));
+
+  // Solo últimos 7 días por fecha real
+  const recientes = registrosConFecha.filter(r => r.fecha_ref >= hace7dias);
+  if (recientes.length === 0) return;
+
+  const registrosSuenoBajo = recientes.filter(r =>
     r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
   );
   if (registrosSuenoBajo.length >= 3) {
@@ -295,9 +354,9 @@ async function evaluarSenales(usuarioId) {
   }
 
   const diasConEnergiaBaja = new Set();
-  registros.forEach(r => {
+  recientes.forEach(r => {
     if (r.energia !== null && r.energia <= 2) {
-      diasConEnergiaBaja.add(new Date(r.created_at).toISOString().split('T')[0]);
+      diasConEnergiaBaja.add(r.fecha_ref.toISOString().split('T')[0]);
     }
   });
   if (diasConEnergiaBaja.size >= 3) {
@@ -306,23 +365,27 @@ async function evaluarSenales(usuarioId) {
     });
   }
 
+  // Correlación sueño → energía usando día calendario real (no diasOrdenados[index+1])
   const registrosPorDia = {};
-  registros.forEach(r => {
-    const dia = new Date(r.created_at).toISOString().split('T')[0];
+  recientes.forEach(r => {
+    const dia = r.fecha_ref.toISOString().split('T')[0];
     if (!registrosPorDia[dia]) registrosPorDia[dia] = [];
     registrosPorDia[dia].push(r);
   });
 
   let correlaciones = 0;
-  const diasOrdenados = Object.keys(registrosPorDia).sort();
-  diasOrdenados.forEach((dia, index) => {
+  Object.keys(registrosPorDia).forEach(dia => {
     const registrosDia = registrosPorDia[dia];
     const tieneSuenoBajo = registrosDia.some(r =>
       r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
     );
     if (tieneSuenoBajo) {
-      const diaSiguiente = diasOrdenados[index + 1];
-      const registrosDiaSiguiente = diaSiguiente ? registrosPorDia[diaSiguiente] : [];
+      // Calcular el día calendario siguiente real
+      const diaSiguiente = new Date(dia);
+      diaSiguiente.setDate(diaSiguiente.getDate() + 1);
+      const diaSiguienteStr = diaSiguiente.toISOString().split('T')[0];
+      const registrosDiaSiguiente = registrosPorDia[diaSiguienteStr] || [];
+
       const energiaBaja = [...registrosDia, ...registrosDiaSiguiente].some(r =>
         r.energia !== null && r.energia <= 2
       );
@@ -331,22 +394,31 @@ async function evaluarSenales(usuarioId) {
   });
   if (correlaciones >= 2) {
     await crearInsight(usuarioId, 'sueno_energia', 'sueno_bajo_energia_baja_7d', {
-      dias_analizados: 7, correlaciones_detectadas: correlaciones, umbral_sueno: 2, umbral_energia: 2
+      dias_analizados: 7, correlaciones_detectadas: correlaciones
     });
   }
 }
 
+// ─── CONTEXTO ────────────────────────────────────────────────────────────────
+
 async function armarContextoReciente(usuarioId) {
   const hace7dias = new Date();
   hace7dias.setDate(hace7dias.getDate() - 7);
-  const { data: registros } = await supabase
+
+  const { data: todos } = await supabase
     .from('registros')
     .select('*')
-    .eq('usuario_id', usuarioId)
-    .gte('created_at', hace7dias.toISOString())
-    .order('created_at', { ascending: true });
+    .eq('usuario_id', usuarioId);
 
-  if (!registros || registros.length === 0) return null;
+  if (!todos || todos.length === 0) return null;
+
+  // Filtrar por fecha_evento || created_at
+  const registros = todos.filter(r => {
+    const fechaRef = new Date(r.fecha_evento || r.created_at);
+    return fechaRef >= hace7dias;
+  });
+
+  if (registros.length === 0) return null;
 
   let contexto = 'CONTEXTO RECIENTE (últimos 7 días):\n';
 
@@ -366,7 +438,7 @@ async function armarContextoReciente(usuarioId) {
   const diasConEnergia = {};
   registros.forEach(r => {
     if (r.energia !== null) {
-      const dia = new Date(r.created_at).toISOString().split('T')[0];
+      const dia = new Date(r.fecha_evento || r.created_at).toISOString().split('T')[0];
       if (!diasConEnergia[dia] || r.energia < diasConEnergia[dia]) diasConEnergia[dia] = r.energia;
     }
   });
@@ -407,9 +479,8 @@ async function armarContextoReciente(usuarioId) {
 
   const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
   if (sintomas.length > 0) {
-    const intensidades = sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad);
-    const maxIntensidad = intensidades.length > 0 ? Math.max(...intensidades) : null;
     const tiposUnicos = [...new Set(sintomas.filter(r => r.sintoma_tipo).map(r => r.sintoma_tipo))];
+    const maxIntensidad = Math.max(...sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad).filter(Boolean));
     contexto += `Síntomas:\n- registros: ${sintomas.length}\n`;
     if (tiposUnicos.length > 0) contexto += `- tipos: ${tiposUnicos.join(', ')}\n`;
     if (maxIntensidad) contexto += `- intensidad máxima: ${maxIntensidad}/5\n`;
@@ -419,9 +490,7 @@ async function armarContextoReciente(usuarioId) {
 }
 
 function getFechaArgentina() {
-  return new Date().toLocaleDateString('en-CA', {
-    timeZone: 'America/Argentina/Buenos_Aires'
-  });
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
 }
 
 function getInicioHoyArgentina() {
@@ -429,24 +498,40 @@ function getInicioHoyArgentina() {
   return new Date(hoyArg + 'T03:00:00.000Z');
 }
 
+function getInicioMananaArgentina() {
+  const manana = new Date(getInicioHoyArgentina());
+  manana.setDate(manana.getDate() + 1);
+  return manana;
+}
+
 async function armarRegistrosHoy(usuarioId) {
   const inicioHoy = getInicioHoyArgentina();
-  const { data: registros } = await supabase
+  const inicioManana = getInicioMananaArgentina();
+
+  const { data: todos } = await supabase
     .from('registros')
-    .select('tipo_registro, comida_momento, created_at')
-    .eq('usuario_id', usuarioId)
-    .gte('created_at', inicioHoy.toISOString())
-    .order('created_at', { ascending: true });
+    .select('tipo_registro, comida_momento, fecha_evento, created_at')
+    .eq('usuario_id', usuarioId);
 
-  if (!registros || registros.length === 0) return 'Hoy no hay registros todavía.';
+  if (!todos || todos.length === 0) return 'Hoy no hay registros todavía.';
 
-  const tipos = registros.map(r => {
+  // Filtrar por fecha_evento || created_at dentro del día de hoy en Argentina
+  const registrosHoy = todos.filter(r => {
+    const fechaRef = new Date(r.fecha_evento || r.created_at);
+    return fechaRef >= inicioHoy && fechaRef < inicioManana;
+  });
+
+  if (registrosHoy.length === 0) return 'Hoy no hay registros todavía.';
+
+  const tipos = registrosHoy.map(r => {
     if (r.tipo_registro === 'comida') return r.comida_momento || 'comida';
     return r.tipo_registro;
   });
 
   return `Registrado hoy (${getFechaArgentina()}): ${tipos.join(', ')}.`;
 }
+
+// ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
 
 async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes) {
   const contenidoImagen = [];
@@ -461,30 +546,29 @@ async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje
     text: mensaje && mensaje.trim() ? mensaje : 'Mirá estas imágenes y respondé como Sabi.'
   });
 
-  const mensajesConImagen = [
-    ...mensajesPrevios.slice(0, -1),
-    { role: 'user', content: contenidoImagen }
-  ];
-
   return await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
     max_tokens: 500,
     system: systemFinal,
-    messages: mensajesConImagen,
+    messages: [...mensajesPrevios.slice(0, -1), { role: 'user', content: contenidoImagen }],
   });
 }
 
-// Genera el resumen semanal con datos reales
+// ─── RESUMEN SEMANAL ──────────────────────────────────────────────────────────
+
 async function generarResumenSemanal(usuarioId) {
   const hace7dias = new Date();
   hace7dias.setDate(hace7dias.getDate() - 7);
 
-  const { data: registros } = await supabase
+  const { data: todos } = await supabase
     .from('registros')
     .select('*')
-    .eq('usuario_id', usuarioId)
-    .gte('created_at', hace7dias.toISOString())
-    .order('created_at', { ascending: true });
+    .eq('usuario_id', usuarioId);
+
+  const registros = (todos || []).filter(r => {
+    const fechaRef = new Date(r.fecha_evento || r.created_at);
+    return fechaRef >= hace7dias;
+  });
 
   const { data: user } = await supabase
     .from('usuarios')
@@ -494,29 +578,26 @@ async function generarResumenSemanal(usuarioId) {
 
   const { data: estado } = await supabase
     .from('estado_usuario')
-    .select('madurez_sabi, dias_con_datos')
+    .select('madurez_sabi')
     .eq('usuario_id', usuarioId)
     .single();
 
-  // Verificar datos suficientes — mínimo 3 días con datos en los últimos 7
   const diasConDatosEstaSemana = new Set(
-    (registros || []).map(r => new Date(r.created_at).toISOString().split('T')[0])
+    registros.map(r => new Date(r.fecha_evento || r.created_at).toISOString().split('T')[0])
   ).size;
 
   if (diasConDatosEstaSemana < 3) {
     return 'Esta semana todavía tengo pocos datos para hacer un resumen útil. Lo más honesto es seguir acumulando registros unos días más.';
   }
 
-  // Armar datos estructurados para pasarle al modelo
-  const suenos = (registros || []).filter(r => r.tipo_registro === 'sueno');
-  const entrenos = (registros || []).filter(r => r.tipo_registro === 'entrenamiento');
-  const comidas = (registros || []).filter(r => r.tipo_registro === 'comida');
-  const estados = (registros || []).filter(r => r.tipo_registro === 'estado');
-  const sintomas = (registros || []).filter(r => r.tipo_registro === 'sintoma');
+  const suenos = registros.filter(r => r.tipo_registro === 'sueno');
+  const entrenos = registros.filter(r => r.tipo_registro === 'entrenamiento');
+  const comidas = registros.filter(r => r.tipo_registro === 'comida');
+  const estados = registros.filter(r => r.tipo_registro === 'estado');
+  const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
 
   let datosResumen = `DATOS DE LA SEMANA (últimos 7 días):\n\n`;
 
-  // Sueño
   if (suenos.length > 0) {
     const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
     const duraciones = suenos.filter(r => r.sueno_duracion_hs !== null).map(r => r.sueno_duracion_hs);
@@ -530,9 +611,10 @@ async function generarResumenSemanal(usuarioId) {
     const notasSueno = suenos.filter(r => r.nota_libre).map(r => r.nota_libre).join(' | ');
     if (notasSueno) datosResumen += ` Notas: ${notasSueno}`;
     datosResumen += '\n\n';
+  } else {
+    datosResumen += 'SUEÑO: sin registros esta semana.\n\n';
   }
 
-  // Entrenamiento
   if (entrenos.length > 0) {
     const fuerza = entrenos.filter(r => r.entreno_tipo === 'fuerza').length;
     const cardio = entrenos.filter(r => r.entreno_tipo === 'cardio').length;
@@ -542,9 +624,10 @@ async function generarResumenSemanal(usuarioId) {
     if (cardio) datosResumen += ` Cardio: ${cardio}.`;
     if (ayunas) datosResumen += ` En ayunas: ${ayunas}.`;
     datosResumen += '\n\n';
+  } else {
+    datosResumen += 'ENTRENAMIENTO: sin registros esta semana.\n\n';
   }
 
-  // Alimentación
   if (comidas.length > 0) {
     const almuerzos = comidas.filter(r => r.comida_momento === 'almuerzo').length;
     const meriendas = comidas.filter(r => r.comida_momento === 'merienda').length;
@@ -552,7 +635,6 @@ async function generarResumenSemanal(usuarioId) {
     datosResumen += `ALIMENTACIÓN: ${comidas.length} registros. Almuerzos: ${almuerzos}, meriendas: ${meriendas}, cenas: ${cenas}.\n\n`;
   }
 
-  // Energía y estado
   if (estados.length > 0) {
     const energias = estados.filter(r => r.energia !== null).map(r => r.energia);
     const promEnergia = energias.length > 0 ? (energias.reduce((a, b) => a + b, 0) / energias.length).toFixed(1) : null;
@@ -561,7 +643,6 @@ async function generarResumenSemanal(usuarioId) {
     datosResumen += '\n\n';
   }
 
-  // Síntomas
   if (sintomas.length > 0) {
     const tiposUnicos = [...new Set(sintomas.filter(r => r.sintoma_tipo).map(r => r.sintoma_tipo))];
     datosResumen += `SÍNTOMAS: ${sintomas.length} registro/s. Tipos: ${tiposUnicos.join(', ')}.\n\n`;
@@ -570,39 +651,34 @@ async function generarResumenSemanal(usuarioId) {
   datosResumen += `DÍAS CON DATOS ESTA SEMANA: ${diasConDatosEstaSemana}\n`;
   datosResumen += `MADUREZ DEL SISTEMA: ${estado?.madurez_sabi || 'escucha'}\n`;
 
-  const promptResumen = `Sos Sabi. Generá el resumen semanal de salud para ${user?.nombre || 'el usuario'}.
+  const promptResumen = `Generá el resumen semanal de salud para ${user?.nombre || 'el usuario'}.
 
 PERFIL BASE:
 ${user?.contexto_base || 'Sin perfil disponible'}
 
 ${datosResumen}
 
-INSTRUCCIONES PARA EL RESUMEN:
-- Máximo 250 palabras en total
-- Sin listas, sin bullets, sin markdown, solo texto plano
-- Sin emojis
-- Estructura exacta (en prosa continua):
-  1. Una observación sobre sueño — dato + interpretación en su contexto
-  2. Una observación sobre movimiento/recuperación
-  3. Una observación sobre nutrición o energía
-  4. El patrón más interesante de la semana — la conexión más relevante entre pilares
-  5. Una sola sugerencia concreta y pequeña para la semana siguiente
-- La sugerencia debe ser específica y accionable — algo que pueda hacer mañana
-- Nunca terminar con "seguí así" genérico
-- Si hay pocos datos en algún pilar, decirlo honestamente en lugar de inventar
-- Tono cálido, directo, sin moralizar`;
+Estructura en prosa continua:
+1. Una observación sobre sueño
+2. Una observación sobre movimiento y recuperación
+3. Una observación sobre nutrición o energía
+4. El patrón más interesante de la semana — conexión entre pilares
+5. Una sola sugerencia concreta para la semana siguiente`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-5',
     max_tokens: 600,
+    system: SABI_RESUMEN_SYSTEM,
     messages: [{ role: 'user', content: promptResumen }]
   });
 
   return response.content[0].text;
 }
 
+// ─── MAIN HANDLER ────────────────────────────────────────────────────────────
+
 app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.0.0' });
+  res.json({ status: 'Sabi está vivo', version: '3.1.0' });
 });
 
 async function procesarChat(usuario, mensaje, res, imagenes) {
@@ -631,12 +707,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     if (!estado) {
       const { data: nuevoEstado } = await supabase
         .from('estado_usuario')
-        .insert([{
-          usuario_id: user.id,
-          onboarding_stage: 'nuevo',
-          modo_usuario: 'general',
-          madurez_sabi: 'escucha'
-        }])
+        .insert([{ usuario_id: user.id, onboarding_stage: 'nuevo', modo_usuario: 'general', madurez_sabi: 'escucha' }])
         .select()
         .single();
       estado = nuevoEstado;
@@ -648,30 +719,36 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     const esMensajeSistema = esAperturaDia || esReapertura;
     const tieneImagenes = imagenes && imagenes.length > 0;
 
+    // Validar media types de imágenes
+    const imagenesValidas = tieneImagenes
+      ? imagenes.filter(img => MEDIA_TYPES_VALIDOS.includes(img.tipo)).slice(0, 5)
+      : null;
+
     let registrosExtraidos = [];
     let cantidadGuardada = 0;
+    let errorExtraccion = false;
 
     if (!enOnboarding && !esMensajeSistema) {
-      registrosExtraidos = await extraerRegistros(mensaje, imagenes);
+      const resultado = await extraerRegistros(mensaje, imagenesValidas);
+      registrosExtraidos = resultado.registros;
+      errorExtraccion = resultado.error;
       cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
     }
 
     if (cantidadGuardada > 0) {
       try {
         await evaluarSenales(user.id);
-        await actualizarMadurez(user.id); // Actualizar madurez después de cada registro
+        await actualizarMadurez(user.id);
       } catch (error) {
         console.error('Error post-registro:', error.message);
       }
     }
 
-    // Recargar estado actualizado después de posible cambio de madurez
     const { data: estadoActualizado } = await supabase
       .from('estado_usuario')
       .select('*')
       .eq('usuario_id', user.id)
       .single();
-
     const estadoFinal = estadoActualizado || estado;
 
     const limiteHistorial = esAperturaDia ? 0 : 20;
@@ -696,7 +773,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
 
     const { data: insightsPendientes } = await supabase
       .from('insights')
-      .select('tipo_insight, regla_origen, evidencia_json, confianza')
+      .select('tipo_insight, regla_origen, confianza')
       .eq('usuario_id', user.id)
       .eq('estado', 'pendiente')
       .order('created_at', { ascending: false })
@@ -723,14 +800,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     if (!enOnboarding && estadoFinal.modo_usuario) {
       systemFinal += `\n\nMODO: ${estadoFinal.modo_usuario}`;
       if (estadoFinal.modo_usuario === 'adulto_mayor') {
-        systemFinal += '\nEste usuario es un adulto mayor. Tono más simple, más cálido, más pausado.';
+        systemFinal += '\nEste usuario es un adulto mayor. Tono más simple, más cálido, más pausado. Sin tecnicismos sin explicar.';
       }
     }
 
     if (!enOnboarding && estadoFinal.madurez_sabi) {
       const madurezTexto = {
         'escucha': 'Estás en etapa de escucha — primeros días. Acusá recibo, respondé consultas directas, no des insights proactivos todavía.',
-        'tendencia_temprana': 'Tenés una semana de datos. Podés señalar tendencias tentativas con honestidad sobre la certeza. Podés hacer observaciones basadas en patrones que empezás a ver.',
+        'tendencia_temprana': 'Tenés una semana de datos. Podés señalar tendencias tentativas con honestidad sobre la certeza.',
         'patron_confirmado': 'Tenés patrones confirmados. Podés dar insights con confianza y hacer sugerencias concretas basadas en correlaciones reales.',
         'profundo': 'Conocés bien el ritmo de esta persona. Podés detectar desvíos del patrón habitual y hacer conexiones sutiles entre pilares.'
       };
@@ -749,6 +826,11 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       systemFinal += `\n\nDATOS REGISTRADOS EN ESTE MENSAJE (${registrosExtraidos.length} registro/s):\n${JSON.stringify(registrosExtraidos, null, 2)}`;
     }
 
+    // Advertencia si el usuario intentó registrar pero no se guardó nada
+    if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || mensaje?.length > 20)) {
+      systemFinal += '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado de este mensaje. Si el usuario intentó registrar algo, no digas "anotado" ni "lo sumo" ni "registrado". Respondé naturalmente sin afirmar que quedó guardado.';
+    }
+
     if (!enOnboarding && insightsPendientes && insightsPendientes.length > 0) {
       systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural):\n';
       insightsPendientes.forEach(i => {
@@ -763,31 +845,30 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
         const diasRestantes = Math.ceil((new Date(e.fecha_evento) - hoy) / (1000 * 60 * 60 * 24));
         systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
       });
-      systemFinal += 'Mencioná estos eventos solo cuando sea relevante.';
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El CONTEXTO RECIENTE y los DATOS REGISTRADOS EN ESTE MENSAJE tienen prioridad sobre el PERFIL DEL USUARIO para el estado actual. REGISTROS DE HOY indica qué ya fue registrado hoy — nunca preguntes por algo que ya está ahí. Si el mensaje tiene múltiples registros, acusá recibo brevemente en una sola respuesta. Si registró la cena o son más de las 21:00 y ya registró las comidas principales, cerrá el día sin abrir nuevas preguntas. Después de acusar recibo podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: REGISTROS DE HOY tiene prioridad absoluta para saber qué ya pasó hoy. Nunca preguntes por algo que ya figura ahí. Si hay múltiples registros nuevos, acusá recibo brevemente en una sola respuesta. Después podés sugerir el próximo momento lógico del día como pregunta breve. Nunca más de una sugerencia. Si es adulto mayor, no anticipes actividad física.';
     }
 
     const mensajesPrevios = (historial || [])
       .reverse()
+      .filter(h => ['user', 'assistant'].includes(h.rol))
       .map(h => ({ role: h.rol, content: h.mensaje }));
 
     mensajesPrevios.push({ role: 'user', content: mensaje || '[imágenes]' });
 
     if (!esMensajeSistema) {
-      const mensajeGuardado = tieneImagenes
-        ? '[imagen' + (imagenes.length > 1 ? 'es' : '') + ']' + (mensaje ? ': ' + mensaje : '')
-        : mensaje;
       await supabase.from('conversaciones').insert([{
-        usuario_id: user.id, rol: 'user', mensaje: mensajeGuardado
+        usuario_id: user.id,
+        rol: 'user',
+        mensaje: tieneImagenes ? '[imagen' + (imagenes.length > 1 ? 'es' : '') + ']' + (mensaje ? ': ' + mensaje : '') : mensaje
       }]);
     }
 
     let response;
-    if (tieneImagenes) {
-      response = await generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes);
+    if (imagenesValidas && imagenesValidas.length > 0) {
+      response = await generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenesValidas);
     } else {
       response = await anthropic.messages.create({
         model: 'claude-sonnet-4-5',
@@ -799,14 +880,8 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
 
     const respuesta = response.content[0].text;
 
-    await supabase.from('conversaciones').insert([{
-      usuario_id: user.id, rol: 'assistant', mensaje: respuesta
-    }]);
-
-    await supabase
-      .from('estado_usuario')
-      .update({ ultimo_mensaje_at: new Date().toISOString() })
-      .eq('usuario_id', user.id);
+    await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
+    await supabase.from('estado_usuario').update({ ultimo_mensaje_at: new Date().toISOString() }).eq('usuario_id', user.id);
 
     res.json({
       respuesta,
@@ -825,8 +900,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
 }
 
 app.get('/chat/:usuario/:mensaje', async (req, res) => {
-  const { usuario, mensaje } = req.params;
-  await procesarChat(usuario, mensaje, res, null);
+  await procesarChat(req.params.usuario, req.params.mensaje, res, null);
 });
 
 app.post('/chat', async (req, res) => {
@@ -834,41 +908,22 @@ app.post('/chat', async (req, res) => {
   if (!usuario || (!mensaje && (!imagenes || imagenes.length === 0))) {
     return res.status(400).json({ error: 'Faltan usuario y mensaje o imágenes' });
   }
-  const imagenesValidadas = imagenes ? imagenes.slice(0, 5) : null;
-  await procesarChat(usuario, mensaje || '', res, imagenesValidadas);
+  await procesarChat(usuario, mensaje || '', res, imagenes ? imagenes.slice(0, 5) : null);
 });
 
-// Endpoint de resumen semanal
 app.post('/resumen', async (req, res) => {
   const { usuario } = req.body;
   if (!usuario) return res.status(400).json({ error: 'Falta usuario' });
-
   try {
-    const { data: user } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('telefono', usuario)
-      .single();
-
+    const { data: user } = await supabase.from('usuarios').select('*').eq('telefono', usuario).single();
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const resumen = await generarResumenSemanal(user.id);
 
-    // Guardar en conversaciones
-    await supabase.from('conversaciones').insert([{
-      usuario_id: user.id,
-      rol: 'assistant',
-      mensaje: resumen
-    }]);
-
-    // Actualizar fecha del último resumen
-    await supabase
-      .from('estado_usuario')
-      .update({ ultimo_resumen_semanal_at: new Date().toISOString() })
-      .eq('usuario_id', user.id);
+    await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: resumen }]);
+    await supabase.from('estado_usuario').update({ ultimo_resumen_semanal_at: new Date().toISOString() }).eq('usuario_id', user.id);
 
     res.json({ resumen, usuario: user.nombre });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -876,35 +931,24 @@ app.post('/resumen', async (req, res) => {
 });
 
 app.get('/checkin/:usuario', async (req, res) => {
-  const { usuario } = req.params;
   try {
-    let { data: user } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('telefono', usuario)
-      .single();
-
+    const { data: user } = await supabase.from('usuarios').select('*').eq('telefono', req.params.usuario).single();
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
-
-    const checkin = {
+    res.json({
       mensaje: `¿Cómo terminó el día, ${user.nombre}?`,
       preguntas: [
-        { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'], pilar: 'foco_energia' },
-        { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'], pilar: 'estres_recuperacion' },
-        { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'], pilar: 'contexto_vida' },
-        { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'], pilar: 'estres_recuperacion' },
-        { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'], pilar: 'movimiento' },
-        { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], pilar: 'contexto_vida', opcional: true }
+        { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'] },
+        { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'] },
+        { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'] },
+        { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'] },
+        { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'] },
+        { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], opcional: true }
       ]
-    };
-
-    res.json(checkin);
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Sabi escuchando en puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Sabi escuchando en puerto ${PORT}`));
