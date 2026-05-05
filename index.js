@@ -556,23 +556,51 @@ async function armarEstadoDia(usuarioId) {
   // Día cerrado si tiene cena registrada
   const diaCerrado = cena;
 
-  // Calcular próximo momento lógico según hora y huecos reales
+  // ── VENTANAS HORARIAS DURAS ──────────────────────────────────────────────
+  // La lógica vive acá, no en el prompt.
+  // El modelo solo redacta — el código decide si hay algo para preguntar.
+  //
+  // Ventanas:
+  //   Antes de 12:00  → sueño, entrenamiento (en ese orden)
+  //   12:00 – 15:59   → almuerzo
+  //   16:00 – 19:59   → merienda
+  //   20:00 en adelante → cena
+  //   21:00 en adelante + cena registrada → cierre del día (trigger_checkin)
+  //
+  // Si ninguna ventana está abierta o todo está registrado → puede_preguntar = false
+
   let proximoMomento = null;
+
   if (!diaCerrado) {
-    if (horaActual >= 21) {
-      proximoMomento = cena ? null : 'cena';
-    } else if (horaActual >= 16) {
-      if (!merienda) proximoMomento = 'merienda';
-      else if (!cena) proximoMomento = 'cena';
-    } else if (horaActual >= 13) {
-      if (!almuerzo) proximoMomento = 'almuerzo';
-      else if (!energia) proximoMomento = 'energia';
-    } else {
-      // Antes de las 13 — preguntar por sueño o entrenamiento, nunca comida
+    if (horaActual < 12) {
       if (!sueno) proximoMomento = 'sueno';
       else if (!entrenamiento) proximoMomento = 'entrenamiento';
+      // Si sueño y entrenamiento ya están → null. No hay ventana abierta para comidas.
+    } else if (horaActual >= 12 && horaActual < 16) {
+      if (!almuerzo) proximoMomento = 'almuerzo';
+    } else if (horaActual >= 16 && horaActual < 20) {
+      if (!merienda) proximoMomento = 'merienda';
+    } else if (horaActual >= 20) {
+      if (!cena) proximoMomento = 'cena';
     }
   }
+
+  // Determinar si puede preguntar y qué acción tomar
+  const puedePreguntar = proximoMomento !== null;
+
+  let accionRecomendada;
+  if (diaCerrado) {
+    accionRecomendada = 'dia_cerrado';
+  } else if (!puedePreguntar) {
+    accionRecomendada = 'cerrar_breve';
+  } else {
+    accionRecomendada = 'preguntar_proximo';
+  }
+
+  // Flag de check-in: se dispara si cena registrada, hora >= 20, no estamos en onboarding
+  // El campo trigger_checkin lo calcula procesarChat() porque tiene acceso al estado de onboarding.
+  // Acá solo calculamos si la condición temporal + registro se cumple.
+  const condicionCheckin = cena && horaActual >= 20;
 
   // Último registro del día
   const ultimoRegistro = registrosHoy.length > 0
@@ -585,6 +613,7 @@ async function armarEstadoDia(usuarioId) {
   // Armar texto estructurado para el prompt
   const fecha = getFechaArgentina();
   let estadoTexto = `ESTADO DEL DÍA (${fecha}):\n`;
+  estadoTexto += `Hora actual: ${horaActual}:00 (Argentina)\n`;
   estadoTexto += `Sueño registrado: ${sueno ? 'sí' : 'no'}\n`;
   estadoTexto += `Entrenamiento registrado: ${entrenamiento ? 'sí' : 'no'}\n`;
   estadoTexto += `Almuerzo registrado: ${almuerzo ? 'sí' : 'no'}\n`;
@@ -594,10 +623,12 @@ async function armarEstadoDia(usuarioId) {
   estadoTexto += `Síntomas registrados: ${sintomas ? 'sí' : 'no'}\n`;
   if (ultimoTipo) estadoTexto += `Último registro: ${ultimoTipo}\n`;
   estadoTexto += `Día cerrado: ${diaCerrado ? 'sí' : 'no'}\n`;
-  estadoTexto += `Próximo momento lógico: ${proximoMomento || 'ninguno — día completo o sin hueco relevante'}\n`;
-  estadoTexto += `\nREGLA: Solo preguntá por el próximo momento lógico si está a menos de 2 horas. Si no hay próximo momento o está lejos, cerrá con algo cálido y breve — sin pregunta. Si el día está cerrado (cena registrada), no abras nuevas preguntas.`;
+  estadoTexto += `Próximo momento habilitado: ${proximoMomento || 'ninguno'}\n`;
+  estadoTexto += `Puede preguntar: ${puedePreguntar ? 'sí' : 'no'}\n`;
+  estadoTexto += `Acción recomendada: ${accionRecomendada}\n`;
+  estadoTexto += `\nREGLA ABSOLUTA: Si "Puede preguntar: no" — no hagas ninguna pregunta. Cerrá con algo breve y cálido. Si "Acción recomendada: dia_cerrado" — terminá con "Buen descanso." o "Buenas noches, [nombre]." sin excepciones. Si "Acción recomendada: preguntar_proximo" — preguntá solo por "${proximoMomento || ''}".`;
 
-  return estadoTexto;
+  return { texto: estadoTexto, condicionCheckin };
 }
 
 // ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
@@ -1268,8 +1299,13 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
-    const estadoDia = !enOnboarding ? await armarEstadoDia(user.id) : null;
+    const estadoDiaResult = !enOnboarding ? await armarEstadoDia(user.id) : null;
+    const estadoDia = estadoDiaResult ? estadoDiaResult.texto : null;
+    const condicionCheckin = estadoDiaResult ? estadoDiaResult.condicionCheckin : false;
     const contextoHabitos = !enOnboarding ? await armarContextoHabitos(user.id) : null;
+
+    // Determinar si corresponde disparar el check-in
+    const triggerCheckin = !enOnboarding && !esMensajeSistema && condicionCheckin;
 
     // Consulta obra social solo si el mensaje lo amerita y el usuario tiene una cargada
     let contextoObraSocial = null;
@@ -1403,15 +1439,32 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       await procesarOnboarding(user.id, estadoFinal, historialCompleto.data || [], respuesta);
     }
 
-    res.json({
+    const responsePayload = {
       respuesta,
       usuario: user.nombre,
       onboarding: enOnboarding,
       modo: estadoFinal.modo_usuario,
       madurez: estadoFinal.madurez_sabi,
       registros_guardados: cantidadGuardada,
-      insights_pendientes: insightsFiltrados ? insightsFiltrados.length : 0
-    });
+      insights_pendientes: insightsFiltrados ? insightsFiltrados.length : 0,
+      trigger_checkin: triggerCheckin || false
+    };
+
+    // Si trigger_checkin, incluir las preguntas para que el frontend las muestre
+    if (triggerCheckin) {
+      responsePayload.checkin = {
+        preguntas: [
+          { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'] },
+          { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'] },
+          { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'] },
+          { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'] },
+          { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'] },
+          { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], opcional: true }
+        ]
+      };
+    }
+
+    res.json(responsePayload);
 
   } catch (error) {
     console.error(error);
@@ -1466,6 +1519,86 @@ app.get('/checkin/:usuario', async (req, res) => {
       ]
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// ─── POST /checkin ───────────────────────────────────────────────────────────
+// Recibe las respuestas del check-in de cierre y las guarda como registros
+// estructurados. No depende del extractor — los datos ya vienen limpios.
+
+const MAPA_ENERGIA_CHECKIN = {
+  'Alta': 5, 'Normal': 3, 'Baja': 2, 'Muy baja': 1
+};
+
+app.post('/checkin', async (req, res) => {
+  const { usuario, respuestas } = req.body;
+  if (!usuario || !respuestas || !Array.isArray(respuestas)) {
+    return res.status(400).json({ error: 'Falta usuario o respuestas' });
+  }
+  try {
+    const { data: user } = await supabase.from('usuarios').select('*').eq('telefono', usuario).single();
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const ahora = new Date().toISOString();
+    const registrosCheckin = [];
+
+    for (const r of respuestas) {
+      if (r.id === 1) {
+        const valorEnergia = MAPA_ENERGIA_CHECKIN[r.valor] || null;
+        if (valorEnergia) {
+          registrosCheckin.push({
+            usuario_id: user.id, tipo_registro: 'estado', fecha_evento: ahora,
+            mensaje_original: `[checkin] energía: ${r.valor}`, origen: 'checkin',
+            energia: valorEnergia, nota_libre: `Energía del día: ${r.valor}`
+          });
+        }
+      } else if (r.id === 2) {
+        registrosCheckin.push({
+          usuario_id: user.id, tipo_registro: 'estado', fecha_evento: ahora,
+          mensaje_original: `[checkin] estado emocional: ${r.valor}`, origen: 'checkin',
+          nota_libre: `Estado emocional: ${r.valor}`
+        });
+      } else if (r.id === 3 || r.id === 4) {
+        registrosCheckin.push({
+          usuario_id: user.id, tipo_registro: 'estado', fecha_evento: ahora,
+          mensaje_original: `[checkin] p${r.id}: ${r.valor}`, origen: 'checkin',
+          nota_libre: r.id === 3 ? `Contacto social: ${r.valor}` : `Desconexión del día: ${r.valor}`
+        });
+      } else if (r.id === 5) {
+        registrosCheckin.push({
+          usuario_id: user.id, tipo_registro: 'estado', fecha_evento: ahora,
+          mensaje_original: `[checkin] cuerpo: ${r.valor}`, origen: 'checkin',
+          nota_libre: `Cuerpo: ${r.valor}`
+        });
+      } else if (r.id === 6 && r.valor && r.valor !== 'No, ya está') {
+        registrosCheckin.push({
+          usuario_id: user.id, tipo_registro: 'evento', fecha_evento: ahora,
+          mensaje_original: `[checkin] nota: ${r.valor}`, origen: 'checkin',
+          nota_libre: r.valor
+        });
+      }
+    }
+
+    let guardados = 0;
+    for (const registro of registrosCheckin) {
+      const { error } = await supabase.from('registros').insert([registro]);
+      if (!error) guardados++;
+    }
+
+    const resumenTexto = respuestas
+      .filter(r => r.valor)
+      .map(r => `p${r.id}: ${r.valor}`)
+      .join(' | ');
+    await supabase.from('conversaciones').insert([{
+      usuario_id: user.id, rol: 'user',
+      mensaje: `[check-in cierre] ${resumenTexto}`
+    }]);
+
+    res.json({ ok: true, registros_guardados: guardados });
+  } catch (error) {
+    console.error('Error guardando check-in:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
