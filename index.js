@@ -57,7 +57,8 @@ Lo que nunca hacés:
 - Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el ESTADO DEL DÍA. Usá el campo "Próximo momento lógico" del ESTADO DEL DÍA para elegir qué preguntar — nunca preguntes por algo ya registrado. Si el próximo momento está a más de 2 horas, preguntá por sueño o cómo amaneció en vez de anticipar comidas.
 - Si el mensaje es "reapertura_del_dia": no saludes. Usá el ESTADO DEL DÍA para elegir qué preguntar — solo el próximo momento lógico si está cerca. Si no hay nada próximo, cerrá con algo cálido y breve sin pregunta.
 - Si el ESTADO DEL DÍA indica "Día cerrado: sí": cerrá con "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas bajo ninguna circunstancia.
-- Si recibís imágenes: describí lo que ves en términos de salud y acusá recibo de los datos extraídos.`;
+- Si recibís imágenes: describí lo que ves en términos de salud y acusá recibo de los datos extraídos.
+- Si en tu respuesta mencionás o usás una señal o insight de los que te pasaron en SEÑALES DETECTADAS, agregá al final del mensaje, en una línea separada y sin explicarlo: [INSIGHT_ID: {id}] donde {id} es el id numérico del insight. Si no usás ningún insight, no agregues nada.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -253,36 +254,36 @@ async function extraerRegistros(mensaje, imagenes) {
 async function guardarRegistros(usuarioId, mensaje, registros) {
   if (!registros || registros.length === 0) return 0;
   const ahora = new Date().toISOString();
-  let guardados = 0;
-  for (const registro of registros) {
-    const { error } = await supabase.from('registros').insert([{
-      usuario_id: usuarioId,
-      tipo_registro: registro.tipo_registro,
-      // fecha_evento: lo que extrajo el modelo, o now() como fallback
-      fecha_evento: registro.fecha_evento || ahora,
-      mensaje_original: mensaje || '[imagen]',
-      origen: 'chat',
-      energia: registro.energia,
-      nota_libre: registro.nota_libre,
-      sueno_calidad: registro.sueno_calidad,
-      sueno_duracion_hs: registro.sueno_duracion_hs,
-      sueno_despertares: registro.sueno_despertares,
-      sueno_hora_dormir: registro.sueno_hora_dormir,
-      sueno_hora_despertar: registro.sueno_hora_despertar,
-      entreno_tipo: registro.entreno_tipo,
-      entreno_percepcion: registro.entreno_percepcion,
-      entreno_ayunas: registro.entreno_ayunas,
-      comida_momento: registro.comida_momento,
-      comida_descripcion: registro.comida_descripcion,
-      sintoma_tipo: registro.sintoma_tipo,
-      sintoma_intensidad: registro.sintoma_intensidad
-    }]);
-    if (error) {
-      console.error(`Error guardando registro ${registro.tipo_registro}:`, error.message);
-    } else {
-      guardados++;
-    }
+
+  // Batch insert — una sola query para todos los registros
+  const filas = registros.map(registro => ({
+    usuario_id: usuarioId,
+    tipo_registro: registro.tipo_registro,
+    fecha_evento: registro.fecha_evento || ahora,
+    mensaje_original: mensaje || '[imagen]',
+    origen: 'chat',
+    energia: registro.energia,
+    nota_libre: registro.nota_libre,
+    sueno_calidad: registro.sueno_calidad,
+    sueno_duracion_hs: registro.sueno_duracion_hs,
+    sueno_despertares: registro.sueno_despertares,
+    sueno_hora_dormir: registro.sueno_hora_dormir,
+    sueno_hora_despertar: registro.sueno_hora_despertar,
+    entreno_tipo: registro.entreno_tipo,
+    entreno_percepcion: registro.entreno_percepcion,
+    entreno_ayunas: registro.entreno_ayunas,
+    comida_momento: registro.comida_momento,
+    comida_descripcion: registro.comida_descripcion,
+    sintoma_tipo: registro.sintoma_tipo,
+    sintoma_intensidad: registro.sintoma_intensidad
+  }));
+
+  const { error, data } = await supabase.from('registros').insert(filas).select('id');
+  if (error) {
+    console.error('Error en batch insert de registros:', error.message);
+    return 0;
   }
+  const guardados = data ? data.length : filas.length;
   return guardados;
 }
 
@@ -428,21 +429,31 @@ Clasificá la respuesta.`;
 // Busca insights en estado 'comunicado' con exposición reciente (últimas 2 horas)
 async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
   try {
-    const hace2horas = new Date();
-    hace2horas.setHours(hace2horas.getHours() - 2);
+    // Usar ultimo_insight_mostrado_id desde estado_usuario — más preciso que ventana de tiempo
+    const { data: estadoU } = await supabase
+      .from('estado_usuario')
+      .select('ultimo_insight_mostrado_id, ultimo_insight_mostrado_at')
+      .eq('usuario_id', usuarioId)
+      .single();
 
-    const { data: insightsRecientes } = await supabase
+    if (!estadoU || !estadoU.ultimo_insight_mostrado_id) return;
+
+    // Ignorar si el insight se mostró hace más de 24 horas
+    if (estadoU.ultimo_insight_mostrado_at) {
+      const hace24h = new Date();
+      hace24h.setHours(hace24h.getHours() - 24);
+      if (new Date(estadoU.ultimo_insight_mostrado_at) < hace24h) return;
+    }
+
+    const { data: insight } = await supabase
       .from('insights')
       .select('id, tipo_insight, regla_origen, confianza, estado, evidencia_json')
-      .eq('usuario_id', usuarioId)
+      .eq('id', estadoU.ultimo_insight_mostrado_id)
       .in('estado', ['pendiente', 'comunicado'])
-      .gte('updated_at', hace2horas.toISOString())
-      .order('updated_at', { ascending: false })
-      .limit(1);
+      .single();
 
-    if (!insightsRecientes || insightsRecientes.length === 0) return;
+    if (!insight) return;
 
-    const insight = insightsRecientes[0];
     // Correr en segundo plano — no await, no bloquea respuesta
     clasificarFeedbackInsight(mensajeUsuario, insight).catch(e =>
       console.error('Clasificador insight background error:', e.message)
@@ -668,11 +679,15 @@ async function armarEstadoDia(usuarioId) {
     .select('tipo_registro, comida_momento, fecha_evento, created_at')
     .eq('usuario_id', usuarioId);
 
-  // Filtrar registros de hoy por fecha real
-  const registrosHoy = (todos || []).filter(r => {
-    const fechaRef = new Date(r.fecha_evento || r.created_at);
-    return fechaRef >= inicioHoy && fechaRef < inicioManana;
-  });
+  // Filtrar registros de hoy por fecha real y ordenar por fecha asc
+  const registrosHoy = (todos || [])
+    .filter(r => {
+      const fechaRef = new Date(r.fecha_evento || r.created_at);
+      return fechaRef >= inicioHoy && fechaRef < inicioManana;
+    })
+    .sort((a, b) =>
+      new Date(a.fecha_evento || a.created_at) - new Date(b.fecha_evento || b.created_at)
+    );
 
   // Flags de qué se registró hoy
   const sueno = registrosHoy.some(r => r.tipo_registro === 'sueno');
@@ -1625,7 +1640,8 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     if (!enOnboarding && insightsFiltrados && insightsFiltrados.length > 0) {
       systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural):\n';
       insightsFiltrados.slice(0, 3).forEach(i => {
-        systemFinal += `- ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
+        // Incluir ID explícito para que el modelo pueda taggear cuál usó
+        systemFinal += `- [id:${i.id}] ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
     }
 
@@ -1673,10 +1689,24 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       });
     }
 
-    const respuesta = response.content[0].text;
+    let respuestaRaw = response.content[0].text;
+
+    // Parsear tag [INSIGHT_ID: xxx] si el modelo lo incluyó
+    // Se remueve del texto antes de enviar al usuario
+    const insightTagMatch = respuestaRaw.match(/\[INSIGHT_ID:\s*(\d+)\]/i);
+    const respuesta = respuestaRaw.replace(/\[INSIGHT_ID:\s*\d+\]\s*/gi, '').trimEnd();
+    const insightUsadoId = insightTagMatch ? parseInt(insightTagMatch[1]) : null;
 
     await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
-    await supabase.from('estado_usuario').update({ ultimo_mensaje_at: new Date().toISOString() }).eq('usuario_id', user.id);
+
+    // Actualizar ultimo_mensaje_at y, si el modelo usó un insight, registrarlo
+    const updateEstadoPayload = { ultimo_mensaje_at: new Date().toISOString() };
+    if (insightUsadoId) {
+      updateEstadoPayload.ultimo_insight_mostrado_id = insightUsadoId;
+      updateEstadoPayload.ultimo_insight_mostrado_at = new Date().toISOString();
+      console.log(`Insight ${insightUsadoId} marcado como mostrado`);
+    }
+    await supabase.from('estado_usuario').update(updateEstadoPayload).eq('usuario_id', user.id);
 
     // Procesar onboarding automático si el usuario todavía no completó
     if (enOnboarding) {
