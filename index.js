@@ -7,8 +7,20 @@ const app = express();
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
+// CORS — orígenes desde variable de entorno ALLOWED_ORIGINS
+// Producción: https://jade-semifreddo-1b6eeb.netlify.app
+// Dev: http://localhost:3000,http://localhost:5173
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['https://jade-semifreddo-1b6eeb.netlify.app'];
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    // Requests server-to-server (WhatsApp webhook, Railway health checks) — sin CORS
+  }
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
@@ -314,6 +326,131 @@ async function actualizarMadurez(usuarioId) {
 }
 
 // ─── SEÑALES ─────────────────────────────────────────────────────────────────
+
+// ── FEEDBACK DE INSIGHTS ──────────────────────────────────────────────────────
+// Mini-clasificador separado de la respuesta conversacional.
+// El modelo solo clasifica y devuelve JSON. El código actualiza Supabase.
+// Se corre en segundo plano — no bloquea la respuesta al usuario.
+
+const PROMPT_CLASIFICADOR_INSIGHT = `Tu única tarea es clasificar si el mensaje del usuario valida, niega o matiza un insight de salud.
+No respondas al usuario. No saludes. Solo devolvé un JSON válido sin texto adicional ni backticks.
+
+Clasificaciones posibles:
+- valida: el usuario confirma que el patrón es real
+- niega: el usuario dice que no es así
+- valida_parcial: reconoce algo pero con matices
+- propone_alternativa: atribuye el patrón a otra causa
+- ambigua: no está claro
+- no_relacionado: el mensaje no habla del insight
+
+{
+  "clasificacion": "valida" | "niega" | "valida_parcial" | "propone_alternativa" | "ambigua" | "no_relacionado",
+  "confianza_clasificacion": "alta" | "media" | "baja",
+  "hipotesis_alternativa": "texto corto o null",
+  "resumen_respuesta_usuario": "texto corto en tercera persona"
+}`;
+
+async function clasificarFeedbackInsight(mensajeUsuario, insight) {
+  try {
+    const prompt = `INSIGHT COMUNICADO AL USUARIO:
+Tipo: ${insight.tipo_insight}
+Regla: ${insight.regla_origen}
+
+RESPUESTA DEL USUARIO:
+"${mensajeUsuario}"
+
+Clasificá la respuesta.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 200,
+      system: PROMPT_CLASIFICADOR_INSIGHT,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    let texto = response.content[0].text.trim();
+    texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+    const resultado = JSON.parse(texto);
+
+    // Determinar nuevo estado según clasificación
+    const ahora = new Date().toISOString();
+    let nuevoEstado = insight.estado;
+    let nuevaConfianza = insight.confianza;
+
+    switch (resultado.clasificacion) {
+      case 'valida':
+        nuevoEstado = 'comunicado';
+        nuevaConfianza = 'confirmado';
+        break;
+      case 'niega':
+        nuevoEstado = 'descartado';
+        nuevaConfianza = 'descartado';
+        break;
+      case 'valida_parcial':
+      case 'propone_alternativa':
+      case 'ambigua':
+        nuevoEstado = 'comunicado';
+        nuevaConfianza = 'tentativo';
+        break;
+      case 'no_relacionado':
+        return; // No tocar el insight
+    }
+
+    // Enriquecer evidencia con el feedback
+    const evidenciaActualizada = {
+      ...(insight.evidencia_json || {}),
+      feedback_usuario: {
+        clasificacion: resultado.clasificacion,
+        resumen: resultado.resumen_respuesta_usuario,
+        hipotesis_alternativa: resultado.hipotesis_alternativa || null,
+        fecha: ahora
+      }
+    };
+
+    await supabase
+      .from('insights')
+      .update({
+        estado: nuevoEstado,
+        confianza: nuevaConfianza,
+        evidencia_json: evidenciaActualizada,
+        fecha_validacion: ahora
+      })
+      .eq('id', insight.id);
+
+    console.log(`Insight ${insight.id} actualizado: ${resultado.clasificacion} → estado: ${nuevoEstado}`);
+  } catch (error) {
+    // Falla silenciosa — no rompe la conversación
+    console.error('Error clasificando feedback de insight:', error.message);
+  }
+}
+
+// Detecta si el último mensaje del sistema fue comunicar un insight y el usuario respondió
+// Busca insights en estado 'comunicado' con exposición reciente (últimas 2 horas)
+async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
+  try {
+    const hace2horas = new Date();
+    hace2horas.setHours(hace2horas.getHours() - 2);
+
+    const { data: insightsRecientes } = await supabase
+      .from('insights')
+      .select('id, tipo_insight, regla_origen, confianza, estado, evidencia_json')
+      .eq('usuario_id', usuarioId)
+      .in('estado', ['pendiente', 'comunicado'])
+      .gte('updated_at', hace2horas.toISOString())
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (!insightsRecientes || insightsRecientes.length === 0) return;
+
+    const insight = insightsRecientes[0];
+    // Correr en segundo plano — no await, no bloquea respuesta
+    clasificarFeedbackInsight(mensajeUsuario, insight).catch(e =>
+      console.error('Clasificador insight background error:', e.message)
+    );
+  } catch (error) {
+    console.error('Error en detectarYClasificarFeedback:', error.message);
+  }
+}
 
 async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
   const hace14dias = new Date();
@@ -632,8 +769,16 @@ async function armarEstadoDia(usuarioId) {
 }
 
 // ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
+//
+// Cuando llegan imágenes + texto largo, se hacen DOS llamadas internas:
+//   1. Extracción de datos de la imagen (ya existente en extraerRegistros)
+//   2. Respuesta conversacional con el contexto completo + datos extraídos
+//
+// El usuario recibe UN SOLO mensaje final.
+// Si la imagen falla, Sabi responde con el texto y avisa que no pudo leer la imagen.
 
 async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes) {
+  // Construir contenido multimodal con imagen(es) + texto
   const contenidoImagen = [];
   for (const img of imagenes) {
     contenidoImagen.push({
@@ -646,12 +791,36 @@ async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje
     text: mensaje && mensaje.trim() ? mensaje : 'Mirá estas imágenes y respondé como Sabi.'
   });
 
-  return await anthropic.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 500,
-    system: systemFinal,
-    messages: [...mensajesPrevios.slice(0, -1), { role: 'user', content: contenidoImagen }],
-  });
+  try {
+    // Llamada con timeout de 30s — imágenes pesadas pueden tardar más que texto
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout_imagen')), 30000)
+    );
+
+    const response = await Promise.race([
+      anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 500,
+        system: systemFinal,
+        messages: [...mensajesPrevios.slice(0, -1), { role: 'user', content: contenidoImagen }],
+      }),
+      timeoutPromise
+    ]);
+
+    return response;
+  } catch (error) {
+    if (error.message === 'timeout_imagen') {
+      console.error('Timeout procesando imagen — respondiendo sin imagen');
+      // Fallback: responder solo con el texto, sin imagen
+      return await anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 500,
+        system: systemFinal + '\n\nADVERTENCIA: No se pudo procesar la imagen adjunta. Respondé al mensaje de texto e informale al usuario que no pudiste leer la imagen — pedile que la reenvíe sola o en mejor calidad.',
+        messages: mensajesPrevios,
+      });
+    }
+    throw error;
+  }
 }
 
 // ─── RESUMEN SEMANAL ──────────────────────────────────────────────────────────
@@ -776,36 +945,111 @@ Estructura en prosa continua:
 }
 
 // ─── HÁBITOS ─────────────────────────────────────────────────────────────────
+//
+// Tipos de hábito y su umbral de inactivación:
+//   Frecuentes (entrenamiento, sueño, comida, energía) → 14 días sin detectarse → inactivo
+//   Clínicos (controles, medicación, síntomas) → no usan umbral automático
+//
+// Ciclo de vida: activo → inactivo → reactivado
+// Si un hábito inactivo reaparece con evidencia, se reactiva manteniendo historial.
+
+const HABITOS_FRECUENTES = [
+  'entreno_ayunas_recurrente', 'fuerza_alta_adherencia', 'sueno_consistente',
+  'sueno_irregular', 'cena_tardia_recurrente',
+  'energia_baja_lunes', 'energia_baja_martes', 'energia_baja_miércoles',
+  'energia_baja_jueves', 'energia_baja_viernes', 'energia_baja_sábado', 'energia_baja_domingo'
+];
 
 async function habitoExiste(usuarioId, tipoHabito) {
+  // Busca hábito activo O inactivo/reactivado para manejar el ciclo completo
   const { data } = await supabase
     .from('habitos_usuario')
-    .select('id, confianza, evidencia_json')
+    .select('id, estado, confianza, evidencia_json, cantidad_reactivaciones, primera_deteccion')
     .eq('usuario_id', usuarioId)
     .eq('tipo_habito', tipoHabito)
-    .eq('estado', 'activo')
+    .in('estado', ['activo', 'inactivo', 'reactivado'])
+    .order('ultima_actualizacion', { ascending: false })
     .limit(1);
   return data && data.length > 0 ? data[0] : null;
 }
 
 async function upsertHabito(usuarioId, tipoHabito, descripcion, evidencia) {
   const existente = await habitoExiste(usuarioId, tipoHabito);
+  const ahora = new Date().toISOString();
+
   if (existente) {
-    // Actualizar evidencia y timestamp
-    await supabase
-      .from('habitos_usuario')
-      .update({ evidencia_json: evidencia, ultima_actualizacion: new Date().toISOString() })
-      .eq('id', existente.id);
+    if (existente.estado === 'inactivo') {
+      // Reactivar — mantener historial, incrementar contador
+      const reactivaciones = (existente.cantidad_reactivaciones || 0) + 1;
+      await supabase
+        .from('habitos_usuario')
+        .update({
+          estado: 'reactivado',
+          descripcion,
+          evidencia_json: evidencia,
+          ultima_actualizacion: ahora,
+          ultima_reactivacion: ahora,
+          cantidad_reactivaciones: reactivaciones,
+          motivo_inactivacion: null
+        })
+        .eq('id', existente.id);
+      console.log(`Hábito reactivado: ${tipoHabito} (reactivación #${reactivaciones})`);
+    } else {
+      // Activo o reactivado — solo actualizar evidencia
+      await supabase
+        .from('habitos_usuario')
+        .update({ descripcion, evidencia_json: evidencia, ultima_actualizacion: ahora })
+        .eq('id', existente.id);
+    }
   } else {
+    // Nuevo hábito
     await supabase.from('habitos_usuario').insert([{
       usuario_id: usuarioId,
       tipo_habito: tipoHabito,
       descripcion,
       confianza: 'tentativo',
       evidencia_json: evidencia,
-      estado: 'activo'
+      estado: 'activo',
+      primera_deteccion: ahora,
+      ultima_actualizacion: ahora,
+      cantidad_reactivaciones: 0
     }]);
     console.log(`Hábito detectado: ${tipoHabito}`);
+  }
+}
+
+// Corre después de detectarHabitos — marca como inactivos los hábitos frecuentes
+// que no se detectaron en los últimos 14 días.
+async function inactivarHabitosVencidos(usuarioId) {
+  try {
+    const hace14dias = new Date();
+    hace14dias.setDate(hace14dias.getDate() - 14);
+
+    const { data: habitos } = await supabase
+      .from('habitos_usuario')
+      .select('id, tipo_habito, ultima_actualizacion')
+      .eq('usuario_id', usuarioId)
+      .in('estado', ['activo', 'reactivado'])
+      .in('tipo_habito', HABITOS_FRECUENTES);
+
+    if (!habitos || habitos.length === 0) return;
+
+    for (const h of habitos) {
+      const ultimaActualizacion = new Date(h.ultima_actualizacion);
+      if (ultimaActualizacion < hace14dias) {
+        await supabase
+          .from('habitos_usuario')
+          .update({
+            estado: 'inactivo',
+            motivo_inactivacion: 'sin_deteccion_14_dias',
+            ultima_actualizacion: new Date().toISOString()
+          })
+          .eq('id', h.id);
+        console.log(`Hábito inactivado: ${h.tipo_habito}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error inactivando hábitos:', error.message);
   }
 }
 
@@ -1246,10 +1490,16 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       try {
         await evaluarSenales(user.id);
         await actualizarMadurez(user.id);
-        await detectarHabitos(user.id); // Detectar hábitos después de cada registro
+        await detectarHabitos(user.id);
+        await inactivarHabitosVencidos(user.id);
       } catch (error) {
         console.error('Error post-registro:', error.message);
       }
+    }
+
+    // Clasificar feedback de insight en segundo plano si el usuario respondió a uno reciente
+    if (!enOnboarding && !esMensajeSistema && mensaje && mensaje.length > 2) {
+      detectarYClasificarFeedback(user.id, mensaje);
     }
 
     const { data: estadoActualizado } = await supabase
