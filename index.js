@@ -54,11 +54,11 @@ Lo que nunca hacés:
 - Nunca repetís el mismo mensaje dos veces seguidas
 - Nunca hablás más de 1-2 veces proactivo por día
 - Nunca preguntás por el desayuno a alguien que hace ayuno intermitente
-- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta basada en el ESTADO DEL DÍA. Usá el campo "Próximo momento lógico" del ESTADO DEL DÍA para elegir qué preguntar — nunca preguntes por algo ya registrado. Si el próximo momento está a más de 2 horas, preguntá por sueño o cómo amaneció en vez de anticipar comidas.
-- Si el mensaje es "reapertura_del_dia": no saludes. Usá el ESTADO DEL DÍA para elegir qué preguntar — solo el próximo momento lógico si está cerca. Si no hay nada próximo, cerrá con algo cálido y breve sin pregunta.
+- Si el mensaje empieza con "APERTURA_DIA:": es la primera apertura del día. Tu respuesta DEBE empezar con "Hola [nombre]." seguido de UNA pregunta concreta — PERO SOLO SI el ESTADO DEL DÍA indica "Puede preguntar: sí". Si indica "Puede preguntar: no", saludá brevemente y cerrá sin abrir ninguna pregunta ni anticipar ningún momento del día.
+- Si el mensaje es "reapertura_del_dia": no saludes. Solo preguntá si el ESTADO DEL DÍA indica "Puede preguntar: sí" y hay un próximo momento habilitado. Si no, cerrá con algo breve y cálido sin pregunta y sin anticipar nada.
 - Si el ESTADO DEL DÍA indica "Día cerrado: sí": cerrá con "Buen descanso." o "Buenas noches, [nombre]." Sin abrir nuevas preguntas bajo ninguna circunstancia.
 - Si recibís imágenes: describí lo que ves en términos de salud y acusá recibo de los datos extraídos.
-- Si en tu respuesta mencionás o usás una señal o insight de los que te pasaron en SEÑALES DETECTADAS, agregá al final del mensaje, en una línea separada y sin explicarlo: [INSIGHT_ID: {id}] donde {id} es el id numérico del insight. Si no usás ningún insight, no agregues nada.`;
+- Si en tu respuesta mencionás o usás una señal o insight de los que te pasaron en SEÑALES DETECTADAS, agregá al final del mensaje, en una línea separada y sin explicarlo: [INSIGHT_ID: {id}] donde {id} es el id exacto del insight. Si no usás ningún insight, no agregues nada.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
 Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
@@ -795,31 +795,78 @@ async function armarEstadoDia(usuarioId) {
 // el guardrail reemplaza la respuesta por una frase segura.
 // El modelo redacta. El código decide si la respuesta es válida.
 
-function contienePregunta(texto) {
+// Señales de pregunta explícita
+const SIGNALS_PREGUNTA = ['?', '¿'];
+
+// Señales de apertura de flujo — menciones de comida o anticipación de momentos futuros
+const SIGNALS_FLUJO_COMIDA = [
+  'almuerzo', 'almorzar', 'almuerces', 'almuerzas',
+  'merienda', 'merendar', 'meriendas',
+  'cenar', 'cenes', 'cenas',
+  'desayuno', 'desayunar'
+];
+
+// "cena" es especial: válida si diaCerrado (ya se registró), inválida si puedePreguntar=false
+const SIGNALS_FLUJO_FUTURO = [
+  'más tarde', 'mas tarde', 'después', 'despues',
+  'queda pendiente', 'pendiente', 'lo vemos',
+  'contame', 'me contás', 'me contas',
+  'registramos', 'lo registramos',
+  'avisame', 'cuando puedas', 'cuando almuerces',
+  'cuando cenes', 'cuando meriendas'
+];
+
+// Momentos del día — para validar que la pregunta sea sobre el momento correcto
+const MOMENTOS_COMIDA = ['almuerzo', 'merienda', 'cena', 'desayuno', 'comida'];
+const MOMENTOS_NO_COMIDA = ['sueno', 'sueño', 'entrenamiento', 'entreno', 'energia', 'energía'];
+
+function abreFlujNoPermitido(texto) {
   if (!texto) return false;
   const t = texto.toLowerCase();
-  return (
-    t.includes('?') ||
-    t.includes('¿') ||
-    t.includes('almuerzo') ||
-    t.includes('merienda') ||
-    t.includes('cena') ||
-    t.includes('comida') ||
-    t.includes('desayuno')
-  );
+  const tienePregunta = SIGNALS_PREGUNTA.some(s => t.includes(s));
+  const tieneComida = SIGNALS_FLUJO_COMIDA.some(s => t.includes(s)) || t.includes('cena');
+  const tieneFuturo = SIGNALS_FLUJO_FUTURO.some(s => t.includes(s));
+  return tienePregunta || tieneComida || tieneFuturo;
 }
 
-function aplicarGuardrailEstadoDia(respuesta, estadoDiaResult) {
+function preguntaSobreMomentoNoPermitido(texto, proximoMomento) {
+  if (!texto || !proximoMomento) return false;
+  const t = texto.toLowerCase();
+  // Si hay pregunta, verificar que no mencione un momento distinto al autorizado
+  const tienePregunta = SIGNALS_PREGUNTA.some(s => t.includes(s));
+  if (!tienePregunta) return false;
+  const todosLosMomentos = [...MOMENTOS_COMIDA, ...MOMENTOS_NO_COMIDA];
+  return todosLosMomentos.some(m => m !== proximoMomento && t.includes(m));
+}
+
+function respuestaSegura(cantidadGuardada, esAperturaDia, nombre) {
+  const nombreStr = nombre ? `, ${nombre}` : '';
+  if (esAperturaDia) return `Buen día${nombreStr}.`;
+  if (cantidadGuardada > 0) return 'Anotado. Lo dejamos registrado.';
+  return 'Te leo.';
+}
+
+function aplicarGuardrailEstadoDia(respuesta, estadoDiaResult, cantidadGuardada, esAperturaDia, nombre) {
   if (!estadoDiaResult) return respuesta;
 
-  if (estadoDiaResult.diaCerrado && contienePregunta(respuesta)) {
-    console.log('Guardrail activado: día cerrado con pregunta detectada');
+  // Caso 1: día cerrado — no puede haber ninguna apertura de flujo
+  if (estadoDiaResult.diaCerrado && abreFlujNoPermitido(respuesta)) {
+    console.log('Guardrail: día cerrado con flujo detectado');
     return 'Listo. Buen descanso.';
   }
 
-  if (!estadoDiaResult.puedePreguntar && contienePregunta(respuesta)) {
-    console.log('Guardrail activado: puedePreguntar=false con pregunta detectada');
-    return 'Registrado. Buen inicio de día.';
+  // Caso 2: no puede preguntar — bloquear cualquier pregunta o apertura de flujo
+  if (!estadoDiaResult.puedePreguntar && abreFlujNoPermitido(respuesta)) {
+    console.log('Guardrail: puedePreguntar=false con flujo detectado');
+    return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
+  }
+
+  // Caso 3: puede preguntar pero solo por el próximo momento — bloquear si pregunta por otro
+  if (estadoDiaResult.puedePreguntar && estadoDiaResult.proximoMomento) {
+    if (preguntaSobreMomentoNoPermitido(respuesta, estadoDiaResult.proximoMomento)) {
+      console.log(`Guardrail: pregunta sobre momento no autorizado (solo permitido: ${estadoDiaResult.proximoMomento})`);
+      return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
+    }
   }
 
   return respuesta;
@@ -1612,12 +1659,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     const contextoHabitos = !enOnboarding ? await armarContextoHabitos(user.id) : null;
 
     // Determinar si corresponde disparar el check-in
-    // No disparar si ya hubo checkin hoy
+    // No disparar si ya fue completado hoy NI si ya fue ofrecido hoy
     let triggerCheckin = false;
     if (!enOnboarding && !esMensajeSistema && condicionCheckin) {
       const inicioHoyCheck = getInicioHoyArgentina();
       const inicioMananaCheck = getInicioMananaArgentina();
-      const { data: checkinHoy } = await supabase
+
+      // Verificar check-in completado hoy
+      const { data: checkinCompletadoHoy } = await supabase
         .from('registros')
         .select('id')
         .eq('usuario_id', user.id)
@@ -1625,7 +1674,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
         .gte('fecha_evento', inicioHoyCheck.toISOString())
         .lt('fecha_evento', inicioMananaCheck.toISOString())
         .limit(1);
-      triggerCheckin = !checkinHoy || checkinHoy.length === 0;
+      const yaCompleto = checkinCompletadoHoy && checkinCompletadoHoy.length > 0;
+
+      // Verificar si ya fue ofrecido hoy (aunque no completado)
+      const yaOfrecido = estadoFinal.ultimo_checkin_ofrecido_at
+        ? new Date(estadoFinal.ultimo_checkin_ofrecido_at) >= inicioHoyCheck
+        : false;
+
+      triggerCheckin = !yaCompleto && !yaOfrecido;
     }
 
     // Consulta obra social solo si el mensaje lo amerita y el usuario tiene una cargada
@@ -1769,8 +1825,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     const insightUsadoId = insightTagMatch ? insightTagMatch[1] : null;
 
     // Guardrail determinístico — si el código dice que no hay nada para preguntar
-    // y el modelo igual preguntó, reemplazar por respuesta segura
-    respuesta = aplicarGuardrailEstadoDia(respuesta, estadoDiaResult);
+    // y el modelo igual preguntó o anticipó flujo, reemplazar por respuesta segura
+    respuesta = aplicarGuardrailEstadoDia(
+      respuesta,
+      estadoDiaResult,
+      cantidadGuardada,
+      esAperturaDia,
+      user.nombre
+    );
 
     await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
 
@@ -1780,6 +1842,9 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       updateEstadoPayload.ultimo_insight_mostrado_id = insightUsadoId;
       updateEstadoPayload.ultimo_insight_mostrado_at = new Date().toISOString();
       console.log(`Insight ${insightUsadoId} marcado como mostrado`);
+    }
+    if (triggerCheckin) {
+      updateEstadoPayload.ultimo_checkin_ofrecido_at = new Date().toISOString();
     }
     await supabase.from('estado_usuario').update(updateEstadoPayload).eq('usuario_id', user.id);
 
