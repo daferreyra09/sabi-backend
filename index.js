@@ -1659,7 +1659,23 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     if (!enOnboarding) {
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El ESTADO DEL DÍA tiene prioridad absoluta para saber qué ya pasó hoy y qué sigue. Nunca preguntes por algo que ya figura como registrado. Usá el campo "Próximo momento lógico" — si dice "ninguno", no abras preguntas. Si hay múltiples registros nuevos, acusá recibo brevemente. Si el día está cerrado, cerrá sin excepciones. Si es adulto mayor, no anticipes actividad física.';
+      // Regla de cierre del día y uso del contexto
+      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El ESTADO DEL DÍA tiene prioridad absoluta para saber qué ya pasó hoy y qué sigue. Nunca preguntes por algo que ya figura como registrado. Si hay múltiples registros nuevos, acusá recibo brevemente. Si es adulto mayor, no anticipes actividad física.';
+
+      // Regla de control de preguntas — reforzada al final del system para que no se diluya
+      if (estadoDia) {
+        const puedePreg = estadoDia.includes('Puede preguntar: sí');
+        const accion = estadoDia.match(/Acción recomendada: (\w+)/)?.[1] || '';
+        const proximo = estadoDia.match(/Próximo momento habilitado: (\w+)/)?.[1] || 'ninguno';
+
+        if (accion === 'dia_cerrado') {
+          systemFinal += '\n\nINSTRUCCIÓN FINAL OBLIGATORIA: El día está cerrado (cena registrada). Terminá con "Buen descanso." o "Buenas noches." SIN abrir ninguna pregunta. Esto no es negociable.';
+        } else if (!puedePreg || proximo === 'ninguno') {
+          systemFinal += `\n\nINSTRUCCIÓN FINAL OBLIGATORIA: No hay ningún momento habilitado para preguntar ahora. La ventana horaria no está abierta. Cerrá con algo breve y cálido SIN hacer ninguna pregunta — ni sobre almuerzo, ni sobre ninguna comida, ni sobre ningún otro evento. Esto no es negociable.`;
+        } else if (puedePreg && proximo && proximo !== 'ninguno') {
+          systemFinal += `\n\nINSTRUCCIÓN FINAL OBLIGATORIA: Si hacés una pregunta, debe ser ÚNICAMENTE sobre "${proximo}". No preguntes por ningún otro evento. Una sola pregunta máximo.`;
+        }
+      }
     }
 
     const mensajesPrevios = (historial || [])
