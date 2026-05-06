@@ -795,48 +795,71 @@ async function armarEstadoDia(usuarioId) {
 // el guardrail reemplaza la respuesta por una frase segura.
 // El modelo redacta. El código decide si la respuesta es válida.
 
-// Señales de pregunta explícita
-const SIGNALS_PREGUNTA = ['?', '¿'];
+// ── GUARDRAIL — política de preguntas y flujo diario ─────────────────────────
+//
+// Regla central:
+//   Bloquear comidas INICIADAS POR SABI fuera de ventana.
+//   NO bloquear comidas que el usuario registró o mencionó.
+//
+// Si el usuario trajo comida → Sabi puede responder sobre ese registro.
+// Si solo Sabi abre flujo futuro → bloquear.
 
-// Señales de apertura de flujo — menciones de comida o anticipación de momentos futuros
-const SIGNALS_FLUJO_COMIDA = [
-  'almuerzo', 'almorzar', 'almuerces', 'almuerzas',
-  'merienda', 'merendar', 'meriendas',
-  'cenar', 'cenes', 'cenas',
-  'desayuno', 'desayunar'
-];
-
-// "cena" es especial: válida si diaCerrado (ya se registró), inválida si puedePreguntar=false
+// Señales de apertura de flujo FUTURO — anticipación de momentos que no llegaron
 const SIGNALS_FLUJO_FUTURO = [
   'más tarde', 'mas tarde', 'después', 'despues',
-  'queda pendiente', 'pendiente', 'lo vemos',
-  'contame', 'me contás', 'me contas',
-  'registramos', 'lo registramos',
-  'avisame', 'cuando puedas', 'cuando almuerces',
-  'cuando cenes', 'cuando meriendas'
+  'queda pendiente', 'lo vemos',
+  'cuando almuerces', 'cuando cenes', 'cuando meriendas', 'cuando puedas',
+  'registramos después', 'lo registramos después'
 ];
 
-// Momentos del día — para validar que la pregunta sea sobre el momento correcto
+// Palabras de comida — se usan solo si el usuario NO las mencionó
+const PALABRAS_COMIDA = [
+  'almuerzo', 'almorzar', 'almuerces', 'almuerzas', 'almorcé',
+  'merienda', 'merendar', 'meriendas', 'merendé',
+  'cena', 'cenar', 'cenes', 'cené',
+  'desayuno', 'desayunar', 'desayuné',
+  'comida', 'comí'
+];
+
 const MOMENTOS_COMIDA = ['almuerzo', 'merienda', 'cena', 'desayuno', 'comida'];
 const MOMENTOS_NO_COMIDA = ['sueno', 'sueño', 'entrenamiento', 'entreno', 'energia', 'energía'];
 
-function abreFlujNoPermitido(texto) {
-  if (!texto) return false;
-  const t = texto.toLowerCase();
-  const tienePregunta = SIGNALS_PREGUNTA.some(s => t.includes(s));
-  const tieneComida = SIGNALS_FLUJO_COMIDA.some(s => t.includes(s)) || t.includes('cena');
-  const tieneFuturo = SIGNALS_FLUJO_FUTURO.some(s => t.includes(s));
-  return tienePregunta || tieneComida || tieneFuturo;
+// ¿El usuario mencionó comida en su mensaje?
+function usuarioMencionoComida(mensajeUsuario) {
+  if (!mensajeUsuario) return false;
+  const t = mensajeUsuario.toLowerCase();
+  return PALABRAS_COMIDA.some(p => t.includes(p));
 }
 
-function preguntaSobreMomentoNoPermitido(texto, proximoMomento) {
-  if (!texto || !proximoMomento) return false;
-  const t = texto.toLowerCase();
-  // Si hay pregunta, verificar que no mencione un momento distinto al autorizado
-  const tienePregunta = SIGNALS_PREGUNTA.some(s => t.includes(s));
+// ¿La respuesta abre flujo futuro no permitido?
+// Si el usuario trajo comida: solo bloqueamos apertura futura, no menciones de esa comida.
+// Si el usuario NO trajo comida: bloqueamos cualquier mención de comida + apertura futura.
+function abreFlujoNoPermitido(respuesta, mensajeUsuario) {
+  if (!respuesta) return false;
+  const r = respuesta.toLowerCase();
+
+  // Siempre bloquear aperturas futuras explícitas
+  if (SIGNALS_FLUJO_FUTURO.some(s => r.includes(s))) return true;
+
+  // Bloquear preguntas explícitas sobre comida futura
+  const tienePregunta = r.includes('?') || r.includes('¿');
+  if (tienePregunta && PALABRAS_COMIDA.some(p => r.includes(p))) return true;
+
+  // Si el usuario NO mencionó comida, bloquear cualquier mención de comida en la respuesta
+  if (!usuarioMencionoComida(mensajeUsuario)) {
+    if (PALABRAS_COMIDA.some(p => r.includes(p))) return true;
+  }
+
+  return false;
+}
+
+function preguntaSobreMomentoNoPermitido(respuesta, proximoMomento) {
+  if (!respuesta || !proximoMomento) return false;
+  const r = respuesta.toLowerCase();
+  const tienePregunta = r.includes('?') || r.includes('¿');
   if (!tienePregunta) return false;
   const todosLosMomentos = [...MOMENTOS_COMIDA, ...MOMENTOS_NO_COMIDA];
-  return todosLosMomentos.some(m => m !== proximoMomento && t.includes(m));
+  return todosLosMomentos.some(m => m !== proximoMomento && r.includes(m));
 }
 
 function respuestaSegura(cantidadGuardada, esAperturaDia, nombre) {
@@ -846,25 +869,25 @@ function respuestaSegura(cantidadGuardada, esAperturaDia, nombre) {
   return 'Te leo.';
 }
 
-function aplicarGuardrailEstadoDia(respuesta, estadoDiaResult, cantidadGuardada, esAperturaDia, nombre) {
+function aplicarGuardrailEstadoDia(respuesta, estadoDiaResult, cantidadGuardada, esAperturaDia, nombre, mensajeUsuario) {
   if (!estadoDiaResult) return respuesta;
 
-  // Caso 1: día cerrado — no puede haber ninguna apertura de flujo
-  if (estadoDiaResult.diaCerrado && abreFlujNoPermitido(respuesta)) {
+  // Caso 1: día cerrado — no puede haber apertura de flujo
+  if (estadoDiaResult.diaCerrado && abreFlujoNoPermitido(respuesta, mensajeUsuario)) {
     console.log('Guardrail: día cerrado con flujo detectado');
     return 'Listo. Buen descanso.';
   }
 
-  // Caso 2: no puede preguntar — bloquear cualquier pregunta o apertura de flujo
-  if (!estadoDiaResult.puedePreguntar && abreFlujNoPermitido(respuesta)) {
-    console.log('Guardrail: puedePreguntar=false con flujo detectado');
+  // Caso 2: no puede preguntar — bloquear flujo iniciado por Sabi
+  if (!estadoDiaResult.puedePreguntar && abreFlujoNoPermitido(respuesta, mensajeUsuario)) {
+    console.log('Guardrail: puedePreguntar=false con flujo de Sabi detectado');
     return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
   }
 
-  // Caso 3: puede preguntar pero solo por el próximo momento — bloquear si pregunta por otro
+  // Caso 3: puede preguntar pero solo por el próximo momento autorizado
   if (estadoDiaResult.puedePreguntar && estadoDiaResult.proximoMomento) {
     if (preguntaSobreMomentoNoPermitido(respuesta, estadoDiaResult.proximoMomento)) {
-      console.log(`Guardrail: pregunta sobre momento no autorizado (solo permitido: ${estadoDiaResult.proximoMomento})`);
+      console.log(`Guardrail: pregunta sobre momento no autorizado (permitido: ${estadoDiaResult.proximoMomento})`);
       return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
     }
   }
@@ -1262,14 +1285,15 @@ async function detectarHabitos(usuarioId) {
         const dia = new Date(r.fecha_evento || r.created_at).getDay();
         conteoXDia[dia] = (conteoXDia[dia] || 0) + 1;
       });
-      Object.entries(conteoXDia).forEach(async ([dia, count]) => {
+      // for...of para que el await se espere correctamente
+      for (const [dia, count] of Object.entries(conteoXDia)) {
         if (count >= 2) {
           await upsertHabito(usuarioId, `energia_baja_${diasSemana[dia]}`,
             `Energía baja se repite los ${diasSemana[dia]} — detectado ${count} veces en los últimos 30 días.`,
             { dia_semana: diasSemana[dia], ocurrencias: count }
           );
         }
-      });
+      }
     }
 
   } catch (error) {
@@ -1282,7 +1306,7 @@ async function armarContextoHabitos(usuarioId) {
     .from('habitos_usuario')
     .select('tipo_habito, descripcion, confianza, ultima_actualizacion')
     .eq('usuario_id', usuarioId)
-    .eq('estado', 'activo')
+    .in('estado', ['activo', 'reactivado'])
     .neq('confianza', 'descartado')
     .order('ultima_actualizacion', { ascending: false })
     .limit(8);
@@ -1641,16 +1665,9 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       .order('created_at', { ascending: false })
       .limit(10);
 
-    // Filtrar insights que no superaron 3 exposiciones y actualizar contador
+    // Filtrar insights que no superaron 3 exposiciones
+    // El contador se incrementa solo cuando el modelo realmente usa el insight (via tag INSIGHT_ID)
     const insightsFiltrados = (insightsPendientes || []).filter(i => (i.contador_exposiciones || 0) < 3);
-    if (insightsFiltrados.length > 0) {
-      for (const insight of insightsFiltrados.slice(0, 3)) {
-        await supabase
-          .from('insights')
-          .update({ contador_exposiciones: (insight.contador_exposiciones || 0) + 1 })
-          .eq('id', insight.id);
-      }
-    }
 
     const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
     const estadoDiaResult = !enOnboarding ? await armarEstadoDia(user.id) : null;
@@ -1824,14 +1841,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     let respuesta = respuestaRaw.replace(/\[INSIGHT_ID:\s*[a-zA-Z0-9-]+\]\s*/gi, '').trimEnd();
     const insightUsadoId = insightTagMatch ? insightTagMatch[1] : null;
 
-    // Guardrail determinístico — si el código dice que no hay nada para preguntar
-    // y el modelo igual preguntó o anticipó flujo, reemplazar por respuesta segura
+    // Guardrail determinístico — distingue si la comida la trajo el usuario o la abrió Sabi
     respuesta = aplicarGuardrailEstadoDia(
       respuesta,
       estadoDiaResult,
       cantidadGuardada,
       esAperturaDia,
-      user.nombre
+      user.nombre,
+      mensaje
     );
 
     await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
@@ -1842,6 +1859,26 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       updateEstadoPayload.ultimo_insight_mostrado_id = insightUsadoId;
       updateEstadoPayload.ultimo_insight_mostrado_at = new Date().toISOString();
       console.log(`Insight ${insightUsadoId} marcado como mostrado`);
+
+      // Marcar el insight como comunicado y subir contador solo cuando se usó realmente
+      try {
+        const { data: insightActual } = await supabase
+          .from('insights')
+          .select('contador_exposiciones')
+          .eq('id', insightUsadoId)
+          .single();
+        await supabase
+          .from('insights')
+          .update({
+            estado: 'comunicado',
+            comunicado_al_usuario: true,
+            fecha_comunicacion: new Date().toISOString(),
+            contador_exposiciones: ((insightActual?.contador_exposiciones || 0) + 1)
+          })
+          .eq('id', insightUsadoId);
+      } catch (e) {
+        console.error('Error actualizando insight comunicado:', e.message);
+      }
     }
     if (triggerCheckin) {
       updateEstadoPayload.ultimo_checkin_ofrecido_at = new Date().toISOString();
@@ -2015,6 +2052,12 @@ app.post('/checkin', async (req, res) => {
       usuario_id: user.id, rol: 'user',
       mensaje: `[check-in cierre] ${resumenTexto}`
     }]);
+
+    // Actualizar ultimo_checkin_at en estado_usuario
+    await supabase
+      .from('estado_usuario')
+      .update({ ultimo_checkin_at: new Date().toISOString() })
+      .eq('usuario_id', user.id);
 
     res.json({ ok: true, registros_guardados: guardados });
   } catch (error) {
