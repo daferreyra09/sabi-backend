@@ -188,7 +188,8 @@ function validarRegistro(obj) {
 
 // ─── EXTRACCIÓN ──────────────────────────────────────────────────────────────
 
-async function extraerRegistros(mensaje, imagenes) {
+async function extraerRegistros(mensaje, imagenes, estadoOperativo) {
+  estadoOperativo = estadoOperativo || '';
   try {
     let contenidoUsuario;
     if (imagenes && imagenes.length > 0) {
@@ -204,13 +205,13 @@ async function extraerRegistros(mensaje, imagenes) {
         text: mensaje && mensaje.trim() ? mensaje : 'Extraé los datos de salud de estas imágenes.'
       });
     } else {
-      // Agregar contexto temporal para que el extractor pueda calcular fechas relativas
+      // Contexto temporal + estado operativo del día para evitar duplicados y errores de clasificación
       const fechaCtx = new Date().toLocaleString('es-AR', {
         timeZone: 'America/Argentina/Buenos_Aires',
         weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
-      contenidoUsuario = `[Contexto: ahora son las ${fechaCtx} en Argentina]\n\n${mensaje}`;
+      contenidoUsuario = `[Contexto: ahora son las ${fechaCtx} en Argentina]\n${estadoOperativo}\n\n${mensaje}`;
     }
 
     // Timeout de 25 segundos para evitar que cuelgue con mensajes pesados
@@ -795,105 +796,8 @@ async function armarEstadoDia(usuarioId) {
 // el guardrail reemplaza la respuesta por una frase segura.
 // El modelo redacta. El código decide si la respuesta es válida.
 
-// ── GUARDRAIL — política de preguntas y flujo diario ─────────────────────────
-//
-// Regla central:
-//   Bloquear comidas INICIADAS POR SABI fuera de ventana.
-//   NO bloquear comidas que el usuario registró o mencionó.
-//
-// Si el usuario trajo comida → Sabi puede responder sobre ese registro.
-// Si solo Sabi abre flujo futuro → bloquear.
-
-// Señales de apertura de flujo FUTURO — anticipación de momentos que no llegaron
-const SIGNALS_FLUJO_FUTURO = [
-  'más tarde', 'mas tarde', 'después', 'despues',
-  'queda pendiente', 'lo vemos',
-  'cuando almuerces', 'cuando cenes', 'cuando meriendas', 'cuando puedas',
-  'registramos después', 'lo registramos después'
-];
-
-// Palabras de comida — se usan solo si el usuario NO las mencionó
-const PALABRAS_COMIDA = [
-  'almuerzo', 'almorzar', 'almuerces', 'almuerzas', 'almorcé',
-  'merienda', 'merendar', 'meriendas', 'merendé',
-  'cena', 'cenar', 'cenes', 'cené',
-  'desayuno', 'desayunar', 'desayuné',
-  'comida', 'comí'
-];
-
-const MOMENTOS_COMIDA = ['almuerzo', 'merienda', 'cena', 'desayuno', 'comida'];
-const MOMENTOS_NO_COMIDA = ['sueno', 'sueño', 'entrenamiento', 'entreno', 'energia', 'energía'];
-
-// ¿El usuario mencionó comida en su mensaje?
-function usuarioMencionoComida(mensajeUsuario) {
-  if (!mensajeUsuario) return false;
-  const t = mensajeUsuario.toLowerCase();
-  return PALABRAS_COMIDA.some(p => t.includes(p));
-}
-
-// ¿La respuesta abre flujo futuro no permitido?
-// Si el usuario trajo comida: solo bloqueamos apertura futura, no menciones de esa comida.
-// Si el usuario NO trajo comida: bloqueamos cualquier mención de comida + apertura futura.
-function abreFlujoNoPermitido(respuesta, mensajeUsuario) {
-  if (!respuesta) return false;
-  const r = respuesta.toLowerCase();
-
-  // Siempre bloquear aperturas futuras explícitas
-  if (SIGNALS_FLUJO_FUTURO.some(s => r.includes(s))) return true;
-
-  // Bloquear preguntas explícitas sobre comida futura
-  const tienePregunta = r.includes('?') || r.includes('¿');
-  if (tienePregunta && PALABRAS_COMIDA.some(p => r.includes(p))) return true;
-
-  // Si el usuario NO mencionó comida, bloquear cualquier mención de comida en la respuesta
-  if (!usuarioMencionoComida(mensajeUsuario)) {
-    if (PALABRAS_COMIDA.some(p => r.includes(p))) return true;
-  }
-
-  return false;
-}
-
-function preguntaSobreMomentoNoPermitido(respuesta, proximoMomento) {
-  if (!respuesta || !proximoMomento) return false;
-  const r = respuesta.toLowerCase();
-  const tienePregunta = r.includes('?') || r.includes('¿');
-  if (!tienePregunta) return false;
-  const todosLosMomentos = [...MOMENTOS_COMIDA, ...MOMENTOS_NO_COMIDA];
-  return todosLosMomentos.some(m => m !== proximoMomento && r.includes(m));
-}
-
-function respuestaSegura(cantidadGuardada, esAperturaDia, nombre) {
-  const nombreStr = nombre ? `, ${nombre}` : '';
-  if (esAperturaDia) return `Buen día${nombreStr}.`;
-  if (cantidadGuardada > 0) return 'Anotado. Lo dejamos registrado.';
-  return 'Te leo.';
-}
-
-function aplicarGuardrailEstadoDia(respuesta, estadoDiaResult, cantidadGuardada, esAperturaDia, nombre, mensajeUsuario) {
-  if (!estadoDiaResult) return respuesta;
-
-  // Caso 1: día cerrado — no puede haber apertura de flujo
-  if (estadoDiaResult.diaCerrado && abreFlujoNoPermitido(respuesta, mensajeUsuario)) {
-    console.log('Guardrail: día cerrado con flujo detectado');
-    return 'Listo. Buen descanso.';
-  }
-
-  // Caso 2: no puede preguntar — bloquear flujo iniciado por Sabi
-  if (!estadoDiaResult.puedePreguntar && abreFlujoNoPermitido(respuesta, mensajeUsuario)) {
-    console.log('Guardrail: puedePreguntar=false con flujo de Sabi detectado');
-    return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
-  }
-
-  // Caso 3: puede preguntar pero solo por el próximo momento autorizado
-  if (estadoDiaResult.puedePreguntar && estadoDiaResult.proximoMomento) {
-    if (preguntaSobreMomentoNoPermitido(respuesta, estadoDiaResult.proximoMomento)) {
-      console.log(`Guardrail: pregunta sobre momento no autorizado (permitido: ${estadoDiaResult.proximoMomento})`);
-      return respuestaSegura(cantidadGuardada, esAperturaDia, nombre);
-    }
-  }
-
-  return respuesta;
-}
+// Guardrail removido — la lógica conversacional vive en el prompt y el estado del día.
+// El código gobierna memoria, registros e insights. El modelo gobierna la conversación.
 
 // ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
 //
@@ -1608,7 +1512,29 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     let resultado = null;
 
     if (!enOnboarding && !esMensajeSistema) {
-      resultado = await extraerRegistros(mensaje, imagenesValidas);
+      // Armar estado operativo mínimo para el extractor — solo qué momentos ya están registrados
+      // Esto reduce duplicados y errores de clasificación en mensajes ambiguos
+      const estadoOperativo = await (async () => {
+        try {
+          const inicioHoyExt = getInicioHoyArgentina();
+          const inicioMananaExt = getInicioMananaArgentina();
+          const { data: regHoy } = await supabase
+            .from('registros')
+            .select('tipo_registro, comida_momento')
+            .eq('usuario_id', user.id)
+            .gte('fecha_evento', inicioHoyExt.toISOString())
+            .lt('fecha_evento', inicioMananaExt.toISOString());
+          const rh = regHoy || [];
+          const tieneSueno = rh.some(r => r.tipo_registro === 'sueno');
+          const tieneEntreno = rh.some(r => r.tipo_registro === 'entrenamiento');
+          const tieneAlmuerzo = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'almuerzo');
+          const tieneMerienda = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'merienda');
+          const tieneCena = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'cena');
+          return `[Registros de hoy: sueno=${tieneSueno}, entrenamiento=${tieneEntreno}, almuerzo=${tieneAlmuerzo}, merienda=${tieneMerienda}, cena=${tieneCena}. Usá esto solo para evitar duplicados y clasificar momentos ambiguos. No bloquees registros legítimos.]`;
+        } catch { return ''; }
+      })();
+
+      resultado = await extraerRegistros(mensaje, imagenesValidas, estadoOperativo);
       registrosExtraidos = resultado.registros;
       errorExtraccion = resultado.error;
       cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
@@ -1788,21 +1714,14 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     }
 
     if (!enOnboarding) {
-      // Regla de cierre del día y uso del contexto
-      systemFinal += '\n\nREGLA DE USO DEL CONTEXTO: El ESTADO DEL DÍA tiene prioridad absoluta para saber qué ya pasó hoy y qué sigue. Nunca preguntes por algo que ya figura como registrado. Si hay múltiples registros nuevos, acusá recibo brevemente. Si es adulto mayor, no anticipes actividad física.';
-
-      // Regla de control de preguntas — reforzada al final del system para que no se diluya
-      if (estadoDia) {
-        const puedePreg = estadoDia.includes('Puede preguntar: sí');
-        const accion = estadoDia.match(/Acción recomendada: (\w+)/)?.[1] || '';
-        const proximo = estadoDia.match(/Próximo momento habilitado: (\w+)/)?.[1] || 'ninguno';
-
-        if (accion === 'dia_cerrado') {
-          systemFinal += '\n\nINSTRUCCIÓN FINAL OBLIGATORIA: El día está cerrado (cena registrada). Terminá con "Buen descanso." o "Buenas noches." SIN abrir ninguna pregunta. Esto no es negociable.';
-        } else if (!puedePreg || proximo === 'ninguno') {
-          systemFinal += `\n\nINSTRUCCIÓN FINAL OBLIGATORIA: No hay ningún momento habilitado para preguntar ahora. La ventana horaria no está abierta. Cerrá con algo breve y cálido SIN hacer ninguna pregunta — ni sobre almuerzo, ni sobre ninguna comida, ni sobre ningún otro evento. Esto no es negociable.`;
-        } else if (puedePreg && proximo && proximo !== 'ninguno') {
-          systemFinal += `\n\nINSTRUCCIÓN FINAL OBLIGATORIA: Si hacés una pregunta, debe ser ÚNICAMENTE sobre "${proximo}". No preguntes por ningún otro evento. Una sola pregunta máximo.`;
+      // Regla única y no contradictoria — el estado del día es la única fuente de verdad
+      if (estadoDiaResult) {
+        if (estadoDiaResult.diaCerrado) {
+          systemFinal += '\n\nESTADO: El día está cerrado. Cerrá con algo breve y cálido. Sin preguntas.';
+        } else if (!estadoDiaResult.puedePreguntar) {
+          systemFinal += '\n\nESTADO: No hay próximo momento habilitado ahora. Respondé sin hacer preguntas sobre el día.';
+        } else if (estadoDiaResult.proximoMomento) {
+          systemFinal += `\n\nESTADO: Si vas a hacer una pregunta sobre el día, que sea sobre "${estadoDiaResult.proximoMomento}". Una sola.`;
         }
       }
     }
@@ -1841,15 +1760,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     let respuesta = respuestaRaw.replace(/\[INSIGHT_ID:\s*[a-zA-Z0-9-]+\]\s*/gi, '').trimEnd();
     const insightUsadoId = insightTagMatch ? insightTagMatch[1] : null;
 
-    // Guardrail determinístico — distingue si la comida la trajo el usuario o la abrió Sabi
-    respuesta = aplicarGuardrailEstadoDia(
-      respuesta,
-      estadoDiaResult,
-      cantidadGuardada,
-      esAperturaDia,
-      user.nombre,
-      mensaje
-    );
+    // Sin guardrail — el modelo maneja la conversación con el contexto del estado del día.
 
     await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
 
