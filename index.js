@@ -1,6 +1,7 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -143,6 +144,50 @@ Si falta información sobre algún pilar, decilo honestamente en lugar de invent
 Máximo 250 palabras en total.
 Una sola sugerencia concreta al final — algo que pueda hacer mañana, no un consejo genérico.
 Nunca terminar con "seguí así" sin contexto específico.`;
+
+// ─── IDEMPOTENCIA DE MENSAJES ────────────────────────────────────────────────
+// Evita procesar dos veces el mismo mensaje si llegó duplicado por reenvío.
+// No aplica a mensajes del sistema (APERTURA_DIA, reapertura_del_dia).
+
+function normalizarMensajeParaHash(mensaje) {
+  return (mensaje || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function calcularHashMensaje(usuarioId, mensaje) {
+  const normalizado = normalizarMensajeParaHash(mensaje);
+  return crypto.createHash('sha256').update(usuarioId + '|' + normalizado).digest('hex');
+}
+
+async function mensajeDuplicado(usuarioId, hash) {
+  const hace10min = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  const { data } = await supabase
+    .from('mensajes_procesados')
+    .select('id, registros_guardados')
+    .eq('usuario_id', usuarioId)
+    .eq('mensaje_hash', hash)
+    .gte('created_at', hace10min)
+    .limit(1);
+  return data && data.length > 0 ? data[0] : null;
+}
+
+async function guardarHashMensaje(usuarioId, hash, mensajeOriginal, registrosGuardados, status) {
+  try {
+    await supabase.from('mensajes_procesados').insert([{
+      usuario_id: usuarioId,
+      mensaje_hash: hash,
+      mensaje_original: (mensajeOriginal || '').slice(0, 500),
+      registros_guardados: registrosGuardados || 0,
+      status: status || 'procesado'
+    }]);
+  } catch (e) {
+    console.error('Error guardando hash mensaje:', e.message);
+  }
+}
 
 // ─── VALIDACIÓN ──────────────────────────────────────────────────────────────
 
@@ -746,8 +791,8 @@ async function armarEstadoDia(usuarioId) {
   if (!diaCerrado) {
     if (horaActual < 12) {
       if (!sueno) proximoMomento = 'sueno';
-      else if (!entrenamiento) proximoMomento = 'entrenamiento';
-      // Si sueño y entrenamiento ya están → null. No hay ventana abierta para comidas.
+      // Entrenamiento no tiene ventana automática — cada persona entrena en distinto momento.
+      // Si el usuario entrenó, lo registra. Sabi no pregunta proactivamente.
     } else if (horaActual >= 12 && horaActual < 16) {
       if (!almuerzo) proximoMomento = 'almuerzo';
     } else if (horaActual >= 16 && horaActual < 20) {
@@ -1707,7 +1752,7 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || (mensaje && mensaje.length > 20))) {
       const esTimeout = resultado && resultado.timeout;
       systemFinal += esTimeout
-        ? '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado y no se guardó ningún registro. El mensaje puede haber sido demasiado largo o pesado. Decile al usuario algo como "Recibí tu mensaje pero hubo un problema al procesarlo — ¿podés separarlo en partes más cortas o enviarlo sin imágenes?" Sin decir "anotado" ni "registrado".'
+        ? '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado. Decile al usuario: "Recibí tu mensaje, tardé más de lo normal en procesarlo. No lo reenvíes todavía — si no aparece registrado, lo revisamos." Sin decir "anotado" ni "registrado".'
         : '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado. Si el usuario intentó registrar algo, no digas "anotado", "registrado" ni "lo sumo". Respondé naturalmente sin afirmar que quedó guardado.';
     }
 
