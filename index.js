@@ -92,48 +92,57 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
       "sintoma_tipo": "texto corto o null",
       "sintoma_intensidad": número 1-5 o null
     }
-  ]
+  ],
+  "requiere_confirmacion_fecha": true | false,
+  "motivo_confirmacion": "texto corto o null"
 }
 
 REGLA CENTRAL: cada evento del mensaje es un registro separado con su propia fecha_evento.
 No copies la misma fecha_evento a todos los registros salvo que el mensaje diga explícitamente que ocurrieron juntos.
 
 REGLAS DE fecha_evento:
-- Hora explícita ("a la 1", "a las 13", "13:30", "a las 6 de la tarde", "tipo 21:00"):
-  Construí fecha_evento con la fecha del contexto y esa hora convertida a UTC.
-  Para comidas y actividades diurnas: "a la 1" = 13:00, "a las 6" = 18:00, "a las 9" = 21:00.
-  Para sueño: "me dormí a las 11" = 23:00, "me desperté a las 6" = 06:00.
-- Referencia relativa clara ("ayer", "anoche", "hoy a la mañana", "el lunes"):
-  Calculá la fecha correcta y usá esa fecha_evento.
-- Referencia vaga ("a media tarde", "temprano", "hace un rato", "recién", "después"):
-  fecha_evento = null. El código usa now() como fallback. No inventes hora.
-- Sin referencia temporal:
-  fecha_evento = null.
+
+USO DEL MAPA_FECHAS:
+El contexto incluye MAPA_FECHAS con las fechas exactas de los últimos 7 días.
+Usalo para resolver referencias de día de semana:
+- "el viernes", "el sábado", "el lunes" → usá la fecha del día más reciente del mapa.
+- "ayer", "anoche" → usá la fecha de ayer del mapa.
+- "anteayer" → usá la fecha de anteayer del mapa.
+- "hace X días" → calculá desde hoy usando el mapa.
+- Día de semana sin aclaración → siempre el más reciente dentro del mapa (últimos 7 días).
+
+HORAS:
+- Hora explícita ("a la 1", "13:30", "a las 6 de la tarde"): construí fecha_evento con la fecha correcta y esa hora convertida a UTC (Argentina = UTC-3).
+  Comidas/actividades diurnas: "a la 1" = 13:00 Argentina, "a las 6" = 18:00, "a las 9" = 21:00.
+  Sueño: "me dormí a las 11" = 23:00, "me desperté a las 6" = 06:00.
+- Sin hora explícita pero con día claro del mapa: usá hora neutra según tipo:
+  desayuno=08:00, almuerzo=13:00, merienda=17:00, cena=21:00, entrenamiento=12:00, sueño=23:00 (hora Argentina, convertí a UTC).
+  Agregá en nota_libre: "hora no especificada".
+- Sin referencia temporal ("recién", "ahora", "hace un rato", sin mención de tiempo): fecha_evento = null. El código usa now() como fallback.
 - Nunca poner fecha futura.
+
+REFERENCIAS AMBIGUAS — NO GUARDAR:
+Si el mensaje contiene referencia temporal pasada que NO podés resolver con el mapa:
+- "el otro día", "la otra noche", "el otro viernes", "hace unos días", "el finde aquel", "esa noche", "ese día", "la semana pasada" sin día específico
+→ devolvé: {"registros": [], "requiere_confirmacion_fecha": true, "motivo_confirmacion": "referencia temporal pasada ambigua"}
+No uses now() como fallback para eventos pasados ambiguos — contamina la memoria.
 
 REGLAS DE comida_momento:
 - Si el usuario nombra el momento ("almorcé", "merendé", "cené", "desayuné"): usá ese momento exacto.
-- Si dice "comí" sin nombrar momento Y hay hora explícita, inferí por hora:
-  06:00-10:59 → desayuno
-  11:00-15:59 → almuerzo
-  16:00-19:29 → merienda
-  19:30-23:59 → cena
-- Si dice "comí" sin nombrar momento Y sin hora explícita: comida_momento = null.
-  No uses la hora actual del contexto para inferir si el usuario habla en pasado sin hora.
-- En duda: null. Es mejor null honesto que momento incorrecto.
+- Si dice "comí" sin nombrar momento Y hay hora explícita: inferí por hora Argentina:
+  06:00-10:59 → desayuno | 11:00-15:59 → almuerzo | 16:00-19:29 → merienda | 19:30-23:59 → cena
+- Si dice "comí" sin nombrar momento Y sin hora: comida_momento = null.
+- En duda: null.
 
 REGLAS ESTRICTAS:
-- Si no hay ningún dato de salud registrable: devolvé {"registros": []}
-- Mensajes que empiezan con "APERTURA_DIA:" y el mensaje "reapertura_del_dia": devolvé {"registros": []}
+- Si no hay ningún dato de salud registrable: devolvé {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
+- Mensajes APERTURA_DIA y reapertura_del_dia: devolvé {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
 - Máximo 6 registros por mensaje
-- Cada objeto representa un evento de salud distinto
-- Puede haber más de un objeto del mismo tipo si son momentos distintos
-- No duplicar el mismo evento
+- Cada objeto representa un evento de salud distinto — no duplicar
 - Todos los campos presentes en cada objeto. Los que no aplican van en null
 - Nunca texto donde corresponde número
 - energia siempre 1-5 o null
-- tipo_registro solo puede ser uno de los valores listados
-- entreno_tipo y comida_momento solo pueden ser los valores listados exactos
+- tipo_registro, entreno_tipo, comida_momento: solo valores listados exactos
 - nota_libre siempre en tercera persona
 - Si recibís imágenes: extraé todos los datos de salud visibles con el mismo formato`;
 
@@ -269,13 +278,32 @@ async function extraerRegistros(mensaje, imagenes, estadoOperativo) {
         text: mensaje && mensaje.trim() ? mensaje : 'Extraé los datos de salud de estas imágenes.'
       });
     } else {
-      // Contexto temporal + estado operativo del día para evitar duplicados y errores de clasificación
-      const fechaCtx = new Date().toLocaleString('es-AR', {
+      // Contexto temporal + mapa de 7 días para resolver referencias como "el viernes", "anteayer"
+      const ahora = new Date();
+      const optsHora = { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit', hour12: false };
+      const optsDate = { timeZone: 'America/Argentina/Buenos_Aires' };
+
+      // Construir mapa de los últimos 7 días en zona Argentina
+      const diasSemana = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+      const mapaFechas = [];
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(ahora);
+        d.setDate(d.getDate() - i);
+        const fechaStr = d.toLocaleDateString('en-CA', optsDate); // YYYY-MM-DD
+        const diaNombre = diasSemana[d.toLocaleDateString('es-AR', { ...optsDate, weekday: 'long' }).split(',')[0] === d.toLocaleDateString('es-AR', { ...optsDate, weekday: 'long' }) ? d.getDay() : d.getDay()];
+        const label = i === 0 ? 'hoy' : i === 1 ? 'ayer' : i === 2 ? 'anteayer' : `hace_${i}_dias`;
+        mapaFechas.push(`${label}(${diasSemana[d.getDay()]})=${fechaStr}`);
+      }
+
+      // Hora actual Argentina
+      const horaActual = ahora.toLocaleString('es-AR', {
         timeZone: 'America/Argentina/Buenos_Aires',
         weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
         hour: '2-digit', minute: '2-digit'
       });
-      contenidoUsuario = `[Contexto: ahora son las ${fechaCtx} en Argentina]\n${estadoOperativo}\n\n${mensaje}`;
+
+      const ctxTemporal = `[Ahora: ${horaActual} | MAPA_FECHAS: ${mapaFechas.join(', ')}]`;
+      contenidoUsuario = `${ctxTemporal}\n${estadoOperativo}\n\n${mensaje}`;
     }
 
     // Timeout de 25 segundos para evitar que cuelgue con mensajes pesados
@@ -1751,9 +1779,15 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
     // Advertencia si el usuario intentó registrar pero no se guardó nada
     if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || (mensaje && mensaje.length > 20))) {
       const esTimeout = resultado && resultado.timeout;
-      systemFinal += esTimeout
-        ? '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado. Decile al usuario: "Recibí tu mensaje, tardé más de lo normal en procesarlo. No lo reenvíes todavía — si no aparece registrado, lo revisamos." Sin decir "anotado" ni "registrado".'
-        : '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado. Si el usuario intentó registrar algo, no digas "anotado", "registrado" ni "lo sumo". Respondé naturalmente sin afirmar que quedó guardado.';
+      const esAmbiguedadFecha = resultado && resultado.requiereConfirmacionFecha;
+
+      if (esAmbiguedadFecha) {
+        systemFinal += '\n\nADVERTENCIA INTERNA: El usuario intentó registrar algo de un día pasado pero la fecha no pudo resolverse con seguridad. No digas que quedó registrado. Pedile una aclaración breve: "¿Qué día fue exactamente?"';
+      } else if (esTimeout) {
+        systemFinal += '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado. Decile al usuario: "Recibí tu mensaje, tardé más de lo normal en procesarlo. No lo reenvíes todavía — si no aparece registrado, lo revisamos." Sin decir "anotado" ni "registrado".';
+      } else {
+        systemFinal += '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado. Si el usuario intentó registrar algo, no digas "anotado", "registrado" ni "lo sumo". Respondé naturalmente sin afirmar que quedó guardado.';
+      }
     }
 
     if (!enOnboarding && insightsFiltrados && insightsFiltrados.length > 0) {
