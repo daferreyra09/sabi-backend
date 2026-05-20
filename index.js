@@ -1,3 +1,23 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Sabi — Backend v3.6.0
+// Acompañante personal de bienestar. Backend conversacional + extractor de
+// registros de salud + detector de patrones.
+//
+// Cambios principales respecto a v3.5.1:
+//   - Flag requiere_confirmacion_fecha propagado end-to-end (bug #1)
+//   - Día de semana en hábitos calculado en zona Argentina (bug #2)
+//   - Ejemplo concreto en prompt del extractor para múltiples eventos
+//   - ESTADO DEL DÍA simplificado — sólo lo que informa decisión
+//   - Una sola regla "una pregunta por respuesta", consolidada
+//   - Resumen humano de registros guardados (en lugar de JSON dump)
+//   - Idempotencia activa con las columnas existentes
+//   - generarRespuesta separada de procesarChat (preparación para WhatsApp)
+//   - GET /chat legacy detrás de NODE_ENV
+//   - System prompts consolidados (menos repetición, menos tokens)
+//   - Math.max defensivo en armarContextoReciente
+//   - Onboarding: nombre solo se busca tras pregunta explícita de Sabi
+// ─────────────────────────────────────────────────────────────────────────────
+
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
@@ -8,9 +28,11 @@ const app = express();
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
-// CORS — orígenes desde variable de entorno ALLOWED_ORIGINS
-// Producción: https://jade-semifreddo-1b6eeb.netlify.app
-// Dev: http://localhost:3000,http://localhost:5173
+// ─── CORS ────────────────────────────────────────────────────────────────────
+// Orígenes desde ALLOWED_ORIGINS. Producción: el dominio de Netlify.
+// Requests server-to-server (WhatsApp webhook, health checks) llegan sin
+// header Origin y no necesitan CORS.
+
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : ['https://jade-semifreddo-1b6eeb.netlify.app'];
@@ -19,8 +41,6 @@ app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.includes(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
-  } else if (!origin) {
-    // Requests server-to-server (WhatsApp webhook, Railway health checks) — sin CORS
   }
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -31,7 +51,10 @@ app.use((req, res, next) => {
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ─── PROMPTS ────────────────────────────────────────────────────────────────
+const MODELO = 'claude-sonnet-4-5';
+const IS_DEV = process.env.NODE_ENV !== 'production';
+
+// ─── PROMPTS ─────────────────────────────────────────────────────────────────
 
 const SABI_SYSTEM = `Sos Sabi, un acompañante personal de salud. Sos el amigo que más sabe — tenés memoria de la persona, la acompañás sin juzgar, y le mostrás lo que no está viendo solo.
 
@@ -47,26 +70,30 @@ Nunca más de una sugerencia a la vez.
 Nunca preguntás por desayuno a alguien que hace ayuno intermitente.
 Nunca repetís la misma observación o pregunta dos veces seguidas.
 
-JERARQUÍA DE COMPORTAMIENTO — en este orden exacto:
-1. Si ESTADO DEL DÍA dice "Día cerrado: sí" → cerrá con algo breve y cálido. Sin preguntas bajo ninguna circunstancia.
-2. Si ESTADO DEL DÍA dice "Puede preguntar: no" → respondé sin hacer preguntas sobre el día ni anticipar momentos futuros.
-3. Si ESTADO DEL DÍA dice "Puede preguntar: sí" → podés hacer UNA sola pregunta corta, sobre el próximo momento habilitado únicamente. Una pregunta. No dos. No tres en una.
-4. Si el usuario hace una pregunta directa → respondé esa pregunta con su contexto personal. La jerarquía anterior no aplica a consultas directas del usuario.
+REGLA DE PREGUNTAS — esto no se relaja por nada:
+Tu respuesta puede contener exactamente cero o una pregunta — nunca dos.
+Si tenés dudas, cero. Si el ESTADO DEL DÍA habilita una pregunta, hacela
+sobre el próximo momento únicamente. No agregues "y vos cómo estás" o
+"¿algo más?" al final. Una respuesta = como máximo un signo de pregunta.
 
 MENSAJES ESPECIALES
-APERTURA_DIA: empezá con "Hola [nombre]." y seguí según la jerarquía de arriba.
-reapertura_del_dia: no saludes. Seguí según la jerarquía de arriba.
+APERTURA_DIA: empezá con "Hola [nombre]." y seguí la lógica del ESTADO DEL DÍA.
+reapertura_del_dia: no saludes. Seguí la lógica del ESTADO DEL DÍA.
 Imágenes: describí lo que ves en términos de salud y acusá recibo de los datos.
-Insights: si usás una señal de SEÑALES DETECTADAS, agregá al final en línea separada: [INSIGHT_ID: {id}]. Si no usás ninguno, no agregues nada.`;
+
+INSIGHTS
+Si usás una señal de SEÑALES DETECTADAS en tu respuesta, agregá al final
+en una línea separada: [INSIGHT_ID: {id}]
+Si no usás ninguno, no agregues nada.`;
 
 const SABI_ONBOARDING = `Sos Sabi. Alguien te escribió por primera vez.
-Tu único objetivo ahora es conocerlo de forma natural y cálida, sin que parezca un formulario.
+Tu objetivo es conocerlo de forma natural y cálida, sin que parezca un formulario.
 Presentate brevemente — una sola oración. Sin emojis.
 Después preguntá solo su nombre. Nada más por ahora.
 Cuando te diga el nombre, preguntá su edad.
 Cuando te diga la edad, preguntá una sola cosa: qué es lo que más quiere mejorar o entender de cómo se siente.
 Después de esas tres respuestas, decile que ya tenés lo suficiente para empezar y que puede contarte lo que quiera cuando quiera.
-Tono: cálido, cercano, sin prisa. Sin emojis.`;
+Tono: cálido, cercano, sin prisa. Sin markdown, sin asteriscos, sin emojis. Texto plano siempre.`;
 
 const SABI_EXTRACTOR = `Tu única tarea es extraer datos estructurados de un mensaje de salud.
 No respondas al usuario. No saludes. No expliques.
@@ -97,14 +124,46 @@ Solo devolvé un JSON válido con exactamente esta estructura, sin texto adicion
   "motivo_confirmacion": "texto corto o null"
 }
 
-REGLA CENTRAL: cada evento del mensaje es un registro separado con su propia fecha_evento.
-No copies la misma fecha_evento a todos los registros salvo que el mensaje diga explícitamente que ocurrieron juntos.
+REGLA CENTRAL: cada evento mencionado es un registro separado con su propia fecha_evento.
+NO copies la misma fecha_evento a todos los registros. Cada uno tiene la suya.
 
-REGLAS DE fecha_evento:
+EJEMPLO CONCRETO:
+Mensaje: "el viernes hice fuerza y ayer cené tarde"
+MAPA_FECHAS dice: hoy(martes)=2026-05-19, ayer(lunes)=2026-05-18, hace_3_dias(viernes)=2026-05-16
+
+Respuesta correcta:
+{
+  "registros": [
+    {
+      "tipo_registro": "entrenamiento",
+      "fecha_evento": "2026-05-16T15:00:00.000Z",
+      "entreno_tipo": "fuerza",
+      "nota_libre": "hizo fuerza el viernes, hora no especificada",
+      "energia": null, "sueno_calidad": null, "sueno_duracion_hs": null,
+      "sueno_despertares": null, "sueno_hora_dormir": null, "sueno_hora_despertar": null,
+      "entreno_percepcion": null, "entreno_ayunas": null,
+      "comida_momento": null, "comida_descripcion": null,
+      "sintoma_tipo": null, "sintoma_intensidad": null
+    },
+    {
+      "tipo_registro": "comida",
+      "fecha_evento": "2026-05-19T00:00:00.000Z",
+      "comida_momento": "cena",
+      "nota_libre": "cenó tarde el lunes, hora no especificada",
+      "energia": null, "sueno_calidad": null, "sueno_duracion_hs": null,
+      "sueno_despertares": null, "sueno_hora_dormir": null, "sueno_hora_despertar": null,
+      "entreno_tipo": null, "entreno_percepcion": null, "entreno_ayunas": null,
+      "comida_descripcion": null, "sintoma_tipo": null, "sintoma_intensidad": null
+    }
+  ],
+  "requiere_confirmacion_fecha": false,
+  "motivo_confirmacion": null
+}
+
+Cada evento tiene la fecha que le corresponde según el mapa. No reutilizar la primera fecha para todos.
 
 USO DEL MAPA_FECHAS:
 El contexto incluye MAPA_FECHAS con las fechas exactas de los últimos 7 días.
-Usalo para resolver referencias de día de semana:
 - "el viernes", "el sábado", "el lunes" → usá la fecha del día más reciente del mapa.
 - "ayer", "anoche" → usá la fecha de ayer del mapa.
 - "anteayer" → usá la fecha de anteayer del mapa.
@@ -112,13 +171,13 @@ Usalo para resolver referencias de día de semana:
 - Día de semana sin aclaración → siempre el más reciente dentro del mapa (últimos 7 días).
 
 HORAS:
-- Hora explícita ("a la 1", "13:30", "a las 6 de la tarde"): construí fecha_evento con la fecha correcta y esa hora convertida a UTC (Argentina = UTC-3).
-  Comidas/actividades diurnas: "a la 1" = 13:00 Argentina, "a las 6" = 18:00, "a las 9" = 21:00.
+- Hora explícita: construí fecha_evento con la fecha correcta y esa hora convertida a UTC (Argentina = UTC-3).
+  Comidas/actividades diurnas: "a la 1" = 13:00 ARG, "a las 6" = 18:00, "a las 9" = 21:00.
   Sueño: "me dormí a las 11" = 23:00, "me desperté a las 6" = 06:00.
-- Sin hora explícita pero con día claro del mapa: usá hora neutra según tipo:
+- Sin hora explícita pero con día claro: usá hora neutra según tipo:
   desayuno=08:00, almuerzo=13:00, merienda=17:00, cena=21:00, entrenamiento=12:00, sueño=23:00 (hora Argentina, convertí a UTC).
   Agregá en nota_libre: "hora no especificada".
-- Sin referencia temporal ("recién", "ahora", "hace un rato", sin mención de tiempo): fecha_evento = null. El código usa now() como fallback.
+- Sin referencia temporal ("recién", "ahora", sin mención de tiempo): fecha_evento = null. El código usa now() como fallback.
 - Nunca poner fecha futura.
 
 REFERENCIAS AMBIGUAS — NO GUARDAR:
@@ -135,8 +194,8 @@ REGLAS DE comida_momento:
 - En duda: null.
 
 REGLAS ESTRICTAS:
-- Si no hay ningún dato de salud registrable: devolvé {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
-- Mensajes APERTURA_DIA y reapertura_del_dia: devolvé {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
+- Si no hay ningún dato de salud registrable: {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
+- Mensajes APERTURA_DIA y reapertura_del_dia: {"registros": [], "requiere_confirmacion_fecha": false, "motivo_confirmacion": null}
 - Máximo 6 registros por mensaje
 - Cada objeto representa un evento de salud distinto — no duplicar
 - Todos los campos presentes en cada objeto. Los que no aplican van en null
@@ -154,15 +213,81 @@ Máximo 250 palabras en total.
 Una sola sugerencia concreta al final — algo que pueda hacer mañana, no un consejo genérico.
 Nunca terminar con "seguí así" sin contexto específico.`;
 
+const PROMPT_CLASIFICADOR_INSIGHT = `Tu única tarea es clasificar si el mensaje del usuario valida, niega o matiza un insight de salud.
+No respondas al usuario. No saludes. Solo devolvé un JSON válido sin texto adicional ni backticks.
+
+Clasificaciones posibles:
+- valida: el usuario confirma que el patrón es real
+- niega: el usuario dice que no es así
+- valida_parcial: reconoce algo pero con matices
+- propone_alternativa: atribuye el patrón a otra causa
+- ambigua: no está claro
+- no_relacionado: el mensaje no habla del insight
+
+{
+  "clasificacion": "valida" | "niega" | "valida_parcial" | "propone_alternativa" | "ambigua" | "no_relacionado",
+  "confianza_clasificacion": "alta" | "media" | "baja",
+  "hipotesis_alternativa": "texto corto o null",
+  "resumen_respuesta_usuario": "texto corto en tercera persona"
+}`;
+
+// ─── UTILIDADES DE FECHA EN ZONA ARGENTINA ───────────────────────────────────
+// Argentina = UTC-3, sin DST. Toda la lógica de "qué día es" debe usar estas
+// funciones, no Date.getDay()/getDate() que operan en zona del proceso (UTC).
+
+const TZ_ARG = 'America/Argentina/Buenos_Aires';
+
+function fechaArgentinaYMD(date) {
+  return (date || new Date()).toLocaleDateString('en-CA', { timeZone: TZ_ARG });
+}
+
+function diaSemanaArgentina(date) {
+  // 0=domingo, 1=lunes, ..., 6=sábado — calculado en zona Argentina.
+  // Truco: parsear el YYYY-MM-DD de Argentina como mediodía local para evitar
+  // bordes de UTC al pasar a Date.
+  const ymd = fechaArgentinaYMD(date);
+  return new Date(ymd + 'T12:00:00-03:00').getDay();
+}
+
+function inicioHoyArgentina() {
+  // Inicio del día calendario Argentina, expresado en UTC.
+  // Si hoy en ARG es 2026-05-19, esto devuelve 2026-05-19T03:00:00.000Z.
+  return new Date(fechaArgentinaYMD() + 'T00:00:00-03:00');
+}
+
+function inicioMananaArgentina() {
+  const m = new Date(inicioHoyArgentina());
+  m.setDate(m.getDate() + 1);
+  return m;
+}
+
+function horaActualArgentina() {
+  return parseInt(
+    new Date().toLocaleString('es-AR', { timeZone: TZ_ARG, hour: '2-digit', hour12: false }).split(':')[0],
+    10
+  );
+}
+
+function fechaCompletaArgentina() {
+  return new Date().toLocaleString('es-AR', {
+    timeZone: TZ_ARG,
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  });
+}
+
 // ─── IDEMPOTENCIA DE MENSAJES ────────────────────────────────────────────────
-// Evita procesar dos veces el mismo mensaje si llegó duplicado por reenvío.
-// No aplica a mensajes del sistema (APERTURA_DIA, reapertura_del_dia).
+// Evita procesar dos veces el mismo mensaje si llegó duplicado.
+// Para mensajes web: hash del contenido + ventana de 10 minutos (cubre
+// double-click, refresh, retries del cliente).
+// Para WhatsApp (cuando se conecte): usar el message ID de Meta como hash,
+// con ventana mucho más larga (días).
 
 function normalizarMensajeParaHash(mensaje) {
   return (mensaje || '')
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -172,19 +297,19 @@ function calcularHashMensaje(usuarioId, mensaje) {
   return crypto.createHash('sha256').update(usuarioId + '|' + normalizado).digest('hex');
 }
 
-async function mensajeDuplicado(usuarioId, hash) {
-  const hace10min = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+async function mensajeYaProcesado(usuarioId, hash, ventanaMinutos = 10) {
+  const limite = new Date(Date.now() - ventanaMinutos * 60 * 1000).toISOString();
   const { data } = await supabase
     .from('mensajes_procesados')
     .select('id, registros_guardados')
     .eq('usuario_id', usuarioId)
     .eq('mensaje_hash', hash)
-    .gte('created_at', hace10min)
+    .gte('created_at', limite)
     .limit(1);
   return data && data.length > 0 ? data[0] : null;
 }
 
-async function guardarHashMensaje(usuarioId, hash, mensajeOriginal, registrosGuardados, status) {
+async function registrarMensajeProcesado(usuarioId, hash, mensajeOriginal, registrosGuardados, status) {
   try {
     await supabase.from('mensajes_procesados').insert([{
       usuario_id: usuarioId,
@@ -194,7 +319,8 @@ async function guardarHashMensaje(usuarioId, hash, mensajeOriginal, registrosGua
       status: status || 'procesado'
     }]);
   } catch (e) {
-    console.error('Error guardando hash mensaje:', e.message);
+    // Falla silenciosa — la idempotencia es protección, no obligación crítica.
+    console.error('Error registrando mensaje procesado:', e.message);
   }
 }
 
@@ -228,8 +354,11 @@ function validarFechaEvento(valor) {
   try {
     const d = new Date(valor);
     if (isNaN(d.getTime())) return null;
-    // Rechazar fechas futuras absurdas (más de 1 día en el futuro)
-    if (d > new Date(Date.now() + 86400000)) return null;
+    // Rechazar futuro absurdo (>1 día) y pasado absurdo (>60 días — más allá
+    // de eso lo más probable es un error del modelo, no un dato legítimo).
+    const ahora = Date.now();
+    if (d.getTime() > ahora + 86400000) return null;
+    if (d.getTime() < ahora - 60 * 86400000) return null;
     return d.toISOString();
   } catch {
     return null;
@@ -261,6 +390,22 @@ function validarRegistro(obj) {
 
 // ─── EXTRACCIÓN ──────────────────────────────────────────────────────────────
 
+function construirMapaFechas() {
+  // Mapa de los últimos 7 días en zona Argentina, con día de semana correcto.
+  const ahora = new Date();
+  const mapa = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(ahora);
+    d.setDate(d.getDate() - i);
+    const fechaStr = d.toLocaleDateString('en-CA', { timeZone: TZ_ARG });
+    const diaNombreRaw = d.toLocaleDateString('es-AR', { timeZone: TZ_ARG, weekday: 'long' });
+    const diaNombre = diaNombreRaw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const label = i === 0 ? 'hoy' : i === 1 ? 'ayer' : i === 2 ? 'anteayer' : `hace_${i}_dias`;
+    mapa.push(`${label}(${diaNombre})=${fechaStr}`);
+  }
+  return mapa.join(', ');
+}
+
 async function extraerRegistros(mensaje, imagenes, estadoOperativo) {
   estadoOperativo = estadoOperativo || '';
   try {
@@ -278,47 +423,17 @@ async function extraerRegistros(mensaje, imagenes, estadoOperativo) {
         text: mensaje && mensaje.trim() ? mensaje : 'Extraé los datos de salud de estas imágenes.'
       });
     } else {
-      // Contexto temporal + mapa de 7 días para resolver referencias como "el viernes", "anteayer"
-      const ahora = new Date();
-      const optsHora = { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit', hour12: false };
-      const optsDate = { timeZone: 'America/Argentina/Buenos_Aires' };
-
-      // Construir mapa de los últimos 7 días en zona Argentina
-      // IMPORTANTE: usar siempre zona Argentina para evitar desfase UTC
-      const diasSemana = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
-      const mapaFechas = [];
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(ahora);
-        d.setDate(d.getDate() - i);
-        // Fecha en formato YYYY-MM-DD zona Argentina
-        const fechaStr = d.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
-        // Día de semana en zona Argentina (no usar getDay() que es UTC)
-        const diaNombreRaw = d.toLocaleDateString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', weekday: 'long' });
-        // toLocaleDateString con weekday long devuelve solo el nombre del día
-        const diaNombre = diaNombreRaw.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        const label = i === 0 ? 'hoy' : i === 1 ? 'ayer' : i === 2 ? 'anteayer' : `hace_${i}_dias`;
-        mapaFechas.push(`${label}(${diaNombre})=${fechaStr}`);
-      }
-
-      // Hora actual Argentina
-      const horaActual = ahora.toLocaleString('es-AR', {
-        timeZone: 'America/Argentina/Buenos_Aires',
-        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-      });
-
-      const ctxTemporal = `[Ahora: ${horaActual} | MAPA_FECHAS: ${mapaFechas.join(', ')}]`;
+      const ctxTemporal = `[Ahora: ${fechaCompletaArgentina()} | MAPA_FECHAS: ${construirMapaFechas()}]`;
       contenidoUsuario = `${ctxTemporal}\n${estadoOperativo}\n\n${mensaje}`;
     }
 
-    // Timeout de 25 segundos para evitar que cuelgue con mensajes pesados
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('timeout_extraccion')), 25000)
     );
 
     const response = await Promise.race([
       anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
+        model: MODELO,
         max_tokens: 2000,
         system: SABI_EXTRACTOR,
         messages: [{ role: 'user', content: contenidoUsuario }]
@@ -329,26 +444,34 @@ async function extraerRegistros(mensaje, imagenes, estadoOperativo) {
     let texto = response.content[0].text.trim();
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     const json = JSON.parse(texto);
-    if (!Array.isArray(json.registros)) return { registros: [], error: false, requiereConfirmacionFecha: false };
+
+    if (!Array.isArray(json.registros)) {
+      return {
+        registros: [],
+        requiereConfirmacionFecha: json.requiere_confirmacion_fecha === true,
+        motivoConfirmacion: json.motivo_confirmacion || null,
+        error: false
+      };
+    }
 
     const validados = json.registros
       .slice(0, 6)
       .map(r => validarRegistro(r))
       .filter(r => r !== null);
 
-    const requiereConfirmacion = json.requiere_confirmacion_fecha === true;
-    if (requiereConfirmacion) {
-      console.log('Extractor: fecha ambigua —', json.motivo_confirmacion);
-      return { registros: [], error: false, requiereConfirmacionFecha: true, motivoConfirmacion: json.motivo_confirmacion };
-    }
-    return { registros: validados, error: false, requiereConfirmacionFecha: false };
+    return {
+      registros: validados,
+      requiereConfirmacionFecha: json.requiere_confirmacion_fecha === true,
+      motivoConfirmacion: json.motivo_confirmacion || null,
+      error: false
+    };
   } catch (error) {
     if (error.message === 'timeout_extraccion') {
       console.error('Timeout en extracción — mensaje demasiado pesado');
-      return { registros: [], error: true, timeout: true, requiereConfirmacionFecha: false };
+      return { registros: [], requiereConfirmacionFecha: false, motivoConfirmacion: null, error: true, timeout: true };
     }
     console.error('Error al extraer:', error.message);
-    return { registros: [], error: true, requiereConfirmacionFecha: false };
+    return { registros: [], requiereConfirmacionFecha: false, motivoConfirmacion: null, error: true };
   }
 }
 
@@ -358,7 +481,6 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
   if (!registros || registros.length === 0) return 0;
   const ahora = new Date().toISOString();
 
-  // Batch insert — una sola query para todos los registros
   const filas = registros.map(registro => ({
     usuario_id: usuarioId,
     tipo_registro: registro.tipo_registro,
@@ -386,8 +508,27 @@ async function guardarRegistros(usuarioId, mensaje, registros) {
     console.error('Error en batch insert de registros:', error.message);
     return 0;
   }
-  const guardados = data ? data.length : filas.length;
-  return guardados;
+  return data ? data.length : filas.length;
+}
+
+// Resumen humano de los registros guardados para inyectar al system.
+// Reemplaza el JSON dump que hacía que el modelo "leyera de vuelta" los datos.
+function resumirRegistrosGuardados(registros) {
+  if (!registros || registros.length === 0) return null;
+  const partes = registros.map(r => {
+    if (r.tipo_registro === 'sueno') {
+      const partesSueno = [];
+      if (r.sueno_duracion_hs) partesSueno.push(`${r.sueno_duracion_hs}hs`);
+      if (r.sueno_calidad) partesSueno.push(`calidad ${r.sueno_calidad}/5`);
+      return `sueño${partesSueno.length ? ' (' + partesSueno.join(', ') + ')' : ''}`;
+    }
+    if (r.tipo_registro === 'entrenamiento') return `entrenamiento${r.entreno_tipo ? ' ' + r.entreno_tipo : ''}`;
+    if (r.tipo_registro === 'comida') return r.comida_momento || 'comida';
+    if (r.tipo_registro === 'estado') return r.energia ? `energía ${r.energia}/5` : 'estado del día';
+    if (r.tipo_registro === 'sintoma') return `síntoma: ${r.sintoma_tipo || 'sin especificar'}`;
+    return r.tipo_registro;
+  });
+  return partes.join(', ');
 }
 
 // ─── MADUREZ ─────────────────────────────────────────────────────────────────
@@ -402,57 +543,25 @@ async function actualizarMadurez(usuarioId) {
     if (!registros) return;
 
     const cantidadRegistros = registros.length;
-    // Usar fecha_evento || created_at para calcular días reales con datos
     const diasConDatos = new Set(
-      registros.map(r => {
-        const fecha = r.fecha_evento || r.created_at;
-        return new Date(fecha).toISOString().split('T')[0];
-      })
+      registros.map(r => fechaArgentinaYMD(new Date(r.fecha_evento || r.created_at)))
     ).size;
 
     let nuevaMadurez = 'escucha';
-    if (diasConDatos >= 31 && cantidadRegistros >= 50) {
-      nuevaMadurez = 'profundo';
-    } else if (diasConDatos >= 15 && cantidadRegistros >= 25) {
-      nuevaMadurez = 'patron_confirmado';
-    } else if (diasConDatos >= 8 && cantidadRegistros >= 10) {
-      nuevaMadurez = 'tendencia_temprana';
-    }
+    if (diasConDatos >= 31 && cantidadRegistros >= 50) nuevaMadurez = 'profundo';
+    else if (diasConDatos >= 15 && cantidadRegistros >= 25) nuevaMadurez = 'patron_confirmado';
+    else if (diasConDatos >= 8 && cantidadRegistros >= 10) nuevaMadurez = 'tendencia_temprana';
 
     await supabase
       .from('estado_usuario')
       .update({ madurez_sabi: nuevaMadurez, cantidad_registros: cantidadRegistros, dias_con_datos: diasConDatos })
       .eq('usuario_id', usuarioId);
-
   } catch (error) {
     console.error('Error actualizando madurez:', error.message);
   }
 }
 
-// ─── SEÑALES ─────────────────────────────────────────────────────────────────
-
-// ── FEEDBACK DE INSIGHTS ──────────────────────────────────────────────────────
-// Mini-clasificador separado de la respuesta conversacional.
-// El modelo solo clasifica y devuelve JSON. El código actualiza Supabase.
-// Se corre en segundo plano — no bloquea la respuesta al usuario.
-
-const PROMPT_CLASIFICADOR_INSIGHT = `Tu única tarea es clasificar si el mensaje del usuario valida, niega o matiza un insight de salud.
-No respondas al usuario. No saludes. Solo devolvé un JSON válido sin texto adicional ni backticks.
-
-Clasificaciones posibles:
-- valida: el usuario confirma que el patrón es real
-- niega: el usuario dice que no es así
-- valida_parcial: reconoce algo pero con matices
-- propone_alternativa: atribuye el patrón a otra causa
-- ambigua: no está claro
-- no_relacionado: el mensaje no habla del insight
-
-{
-  "clasificacion": "valida" | "niega" | "valida_parcial" | "propone_alternativa" | "ambigua" | "no_relacionado",
-  "confianza_clasificacion": "alta" | "media" | "baja",
-  "hipotesis_alternativa": "texto corto o null",
-  "resumen_respuesta_usuario": "texto corto en tercera persona"
-}`;
+// ─── FEEDBACK DE INSIGHTS ────────────────────────────────────────────────────
 
 async function clasificarFeedbackInsight(mensajeUsuario, insight) {
   try {
@@ -466,7 +575,7 @@ RESPUESTA DEL USUARIO:
 Clasificá la respuesta.`;
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: MODELO,
       max_tokens: 200,
       system: PROMPT_CLASIFICADOR_INSIGHT,
       messages: [{ role: 'user', content: prompt }]
@@ -476,7 +585,6 @@ Clasificá la respuesta.`;
     texto = texto.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     const resultado = JSON.parse(texto);
 
-    // Determinar nuevo estado según clasificación
     const ahora = new Date().toISOString();
     let nuevoEstado = insight.estado;
     let nuevaConfianza = insight.confianza;
@@ -497,10 +605,9 @@ Clasificá la respuesta.`;
         nuevaConfianza = 'tentativo';
         break;
       case 'no_relacionado':
-        return; // No tocar el insight
+        return;
     }
 
-    // Enriquecer evidencia con el feedback
     const evidenciaActualizada = {
       ...(insight.evidencia_json || {}),
       feedback_usuario: {
@@ -521,18 +628,14 @@ Clasificá la respuesta.`;
       })
       .eq('id', insight.id);
 
-    console.log(`Insight ${insight.id} actualizado: ${resultado.clasificacion} → estado: ${nuevoEstado}`);
+    console.log(`Insight ${insight.id}: ${resultado.clasificacion} → ${nuevoEstado}`);
   } catch (error) {
-    // Falla silenciosa — no rompe la conversación
     console.error('Error clasificando feedback de insight:', error.message);
   }
 }
 
-// Detecta si el último mensaje del sistema fue comunicar un insight y el usuario respondió
-// Busca insights en estado 'comunicado' con exposición reciente (últimas 2 horas)
 async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
   try {
-    // Usar ultimo_insight_mostrado_id desde estado_usuario — más preciso que ventana de tiempo
     const { data: estadoU } = await supabase
       .from('estado_usuario')
       .select('ultimo_insight_mostrado_id, ultimo_insight_mostrado_at')
@@ -541,7 +644,6 @@ async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
 
     if (!estadoU || !estadoU.ultimo_insight_mostrado_id) return;
 
-    // Ignorar si el insight se mostró hace más de 24 horas
     if (estadoU.ultimo_insight_mostrado_at) {
       const hace24h = new Date();
       hace24h.setHours(hace24h.getHours() - 24);
@@ -557,7 +659,7 @@ async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
 
     if (!insight) return;
 
-    // Correr en segundo plano — no await, no bloquea respuesta
+    // Segundo plano — no bloquea respuesta al usuario
     clasificarFeedbackInsight(mensajeUsuario, insight).catch(e =>
       console.error('Clasificador insight background error:', e.message)
     );
@@ -565,6 +667,8 @@ async function detectarYClasificarFeedback(usuarioId, mensajeUsuario) {
     console.error('Error en detectarYClasificarFeedback:', error.message);
   }
 }
+
+// ─── SEÑALES (INSIGHTS) ──────────────────────────────────────────────────────
 
 async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
   const hace14dias = new Date();
@@ -582,11 +686,14 @@ async function insightExiste(usuarioId, tipoInsight, reglaOrigen) {
 }
 
 async function crearInsight(usuarioId, tipoInsight, reglaOrigen, evidencia) {
-  const existe = await insightExiste(usuarioId, tipoInsight, reglaOrigen);
-  if (existe) return;
+  if (await insightExiste(usuarioId, tipoInsight, reglaOrigen)) return;
   const { error } = await supabase.from('insights').insert([{
-    usuario_id: usuarioId, tipo_insight: tipoInsight, regla_origen: reglaOrigen,
-    evidencia_json: evidencia, confianza: 'tentativo', estado: 'pendiente'
+    usuario_id: usuarioId,
+    tipo_insight: tipoInsight,
+    regla_origen: reglaOrigen,
+    evidencia_json: evidencia,
+    confianza: 'tentativo',
+    estado: 'pendiente'
   }]);
   if (error) console.error('Error creando insight:', error.message);
   else console.log(`Insight creado: ${tipoInsight} / ${reglaOrigen}`);
@@ -603,29 +710,25 @@ async function evaluarSenales(usuarioId) {
 
   if (!registros || registros.length === 0) return;
 
-  // Usar fecha_evento || created_at como fecha real del evento
-  const registrosConFecha = registros.map(r => ({
-    ...r,
-    fecha_ref: new Date(r.fecha_evento || r.created_at)
-  }));
+  const recientes = registros
+    .map(r => ({ ...r, fecha_ref: new Date(r.fecha_evento || r.created_at) }))
+    .filter(r => r.fecha_ref >= hace7dias);
 
-  // Solo últimos 7 días por fecha real
-  const recientes = registrosConFecha.filter(r => r.fecha_ref >= hace7dias);
   if (recientes.length === 0) return;
 
-  const registrosSuenoBajo = recientes.filter(r =>
+  const suenoBajo = recientes.filter(r =>
     r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
   );
-  if (registrosSuenoBajo.length >= 3) {
+  if (suenoBajo.length >= 3) {
     await crearInsight(usuarioId, 'sueno_recuperacion', 'sueno_bajo_repetido_7d', {
-      dias_analizados: 7, registros_sueno_bajo: registrosSuenoBajo.length, umbral: 2
+      dias_analizados: 7, registros_sueno_bajo: suenoBajo.length, umbral: 2
     });
   }
 
   const diasConEnergiaBaja = new Set();
   recientes.forEach(r => {
     if (r.energia !== null && r.energia <= 2) {
-      diasConEnergiaBaja.add(r.fecha_ref.toISOString().split('T')[0]);
+      diasConEnergiaBaja.add(fechaArgentinaYMD(r.fecha_ref));
     }
   });
   if (diasConEnergiaBaja.size >= 3) {
@@ -634,28 +737,27 @@ async function evaluarSenales(usuarioId) {
     });
   }
 
-  // Correlación sueño → energía usando día calendario real (no diasOrdenados[index+1])
+  // Correlación sueño → energía usando día calendario Argentina
   const registrosPorDia = {};
   recientes.forEach(r => {
-    const dia = r.fecha_ref.toISOString().split('T')[0];
+    const dia = fechaArgentinaYMD(r.fecha_ref);
     if (!registrosPorDia[dia]) registrosPorDia[dia] = [];
     registrosPorDia[dia].push(r);
   });
 
   let correlaciones = 0;
   Object.keys(registrosPorDia).forEach(dia => {
-    const registrosDia = registrosPorDia[dia];
-    const tieneSuenoBajo = registrosDia.some(r =>
+    const regsDia = registrosPorDia[dia];
+    const tieneSuenoBajo = regsDia.some(r =>
       r.tipo_registro === 'sueno' && r.sueno_calidad !== null && r.sueno_calidad <= 2
     );
     if (tieneSuenoBajo) {
-      // Calcular el día calendario siguiente real
-      const diaSiguiente = new Date(dia);
-      diaSiguiente.setDate(diaSiguiente.getDate() + 1);
-      const diaSiguienteStr = diaSiguiente.toISOString().split('T')[0];
-      const registrosDiaSiguiente = registrosPorDia[diaSiguienteStr] || [];
+      const diaSiguienteDate = new Date(dia + 'T12:00:00-03:00');
+      diaSiguienteDate.setDate(diaSiguienteDate.getDate() + 1);
+      const diaSiguienteStr = fechaArgentinaYMD(diaSiguienteDate);
+      const regsSiguiente = registrosPorDia[diaSiguienteStr] || [];
 
-      const energiaBaja = [...registrosDia, ...registrosDiaSiguiente].some(r =>
+      const energiaBaja = [...regsDia, ...regsSiguiente].some(r =>
         r.energia !== null && r.energia <= 2
       );
       if (energiaBaja) correlaciones++;
@@ -668,7 +770,7 @@ async function evaluarSenales(usuarioId) {
   }
 }
 
-// ─── CONTEXTO ────────────────────────────────────────────────────────────────
+// ─── CONTEXTO RECIENTE ───────────────────────────────────────────────────────
 
 async function armarContextoReciente(usuarioId) {
   const hace7dias = new Date();
@@ -681,12 +783,7 @@ async function armarContextoReciente(usuarioId) {
 
   if (!todos || todos.length === 0) return null;
 
-  // Filtrar por fecha_evento || created_at
-  const registros = todos.filter(r => {
-    const fechaRef = new Date(r.fecha_evento || r.created_at);
-    return fechaRef >= hace7dias;
-  });
-
+  const registros = todos.filter(r => new Date(r.fecha_evento || r.created_at) >= hace7dias);
   if (registros.length === 0) return null;
 
   let contexto = 'CONTEXTO RECIENTE (últimos 7 días):\n';
@@ -707,7 +804,7 @@ async function armarContextoReciente(usuarioId) {
   const diasConEnergia = {};
   registros.forEach(r => {
     if (r.energia !== null) {
-      const dia = new Date(r.fecha_evento || r.created_at).toISOString().split('T')[0];
+      const dia = fechaArgentinaYMD(new Date(r.fecha_evento || r.created_at));
       if (!diasConEnergia[dia] || r.energia < diasConEnergia[dia]) diasConEnergia[dia] = r.energia;
     }
   });
@@ -749,139 +846,88 @@ async function armarContextoReciente(usuarioId) {
   const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
   if (sintomas.length > 0) {
     const tiposUnicos = [...new Set(sintomas.filter(r => r.sintoma_tipo).map(r => r.sintoma_tipo))];
-    const maxIntensidad = Math.max(...sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad).filter(Boolean));
+    const intensidades = sintomas.filter(r => r.sintoma_intensidad !== null).map(r => r.sintoma_intensidad);
     contexto += `Síntomas:\n- registros: ${sintomas.length}\n`;
     if (tiposUnicos.length > 0) contexto += `- tipos: ${tiposUnicos.join(', ')}\n`;
-    if (maxIntensidad) contexto += `- intensidad máxima: ${maxIntensidad}/5\n`;
+    // Math.max defensivo — solo si hay al menos un valor
+    if (intensidades.length > 0) contexto += `- intensidad máxima: ${Math.max(...intensidades)}/5\n`;
   }
 
   return contexto;
 }
 
-function getFechaArgentina() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
-}
-
-function getInicioHoyArgentina() {
-  const hoyArg = getFechaArgentina();
-  return new Date(hoyArg + 'T03:00:00.000Z');
-}
-
-function getInicioMananaArgentina() {
-  const manana = new Date(getInicioHoyArgentina());
-  manana.setDate(manana.getDate() + 1);
-  return manana;
-}
+// ─── ESTADO DEL DÍA ──────────────────────────────────────────────────────────
+// Esto es la fuente de verdad sobre "qué pasó hoy y qué sigue".
+// Se le pasa al modelo SOLO lo que informa decisión: qué momentos están
+// registrados (los que el código usa para decidir si preguntar), si el día
+// está cerrado, y cuál es el próximo momento habilitado.
+//
+// Se removieron: "Entrenamiento registrado", "Energía registrada",
+// "Síntomas registrados", "Último registro". Estos campos hacían que el
+// modelo preguntara cosas que el código no quería que preguntara.
 
 async function armarEstadoDia(usuarioId) {
-  const inicioHoy = getInicioHoyArgentina();
-  const inicioManana = getInicioMananaArgentina();
+  const inicioHoy = inicioHoyArgentina();
+  const inicioManana = inicioMananaArgentina();
 
   const { data: todos } = await supabase
     .from('registros')
     .select('tipo_registro, comida_momento, fecha_evento, created_at')
     .eq('usuario_id', usuarioId);
 
-  // Filtrar registros de hoy por fecha real y ordenar por fecha asc
-  const registrosHoy = (todos || [])
-    .filter(r => {
-      const fechaRef = new Date(r.fecha_evento || r.created_at);
-      return fechaRef >= inicioHoy && fechaRef < inicioManana;
-    })
-    .sort((a, b) =>
-      new Date(a.fecha_evento || a.created_at) - new Date(b.fecha_evento || b.created_at)
-    );
+  const registrosHoy = (todos || []).filter(r => {
+    const fechaRef = new Date(r.fecha_evento || r.created_at);
+    return fechaRef >= inicioHoy && fechaRef < inicioManana;
+  });
 
-  // Flags de qué se registró hoy
   const sueno = registrosHoy.some(r => r.tipo_registro === 'sueno');
-  const entrenamiento = registrosHoy.some(r => r.tipo_registro === 'entrenamiento');
   const almuerzo = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'almuerzo');
   const merienda = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'merienda');
   const cena = registrosHoy.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'cena');
-  const energia = registrosHoy.some(r => r.tipo_registro === 'estado');
-  const sintomas = registrosHoy.some(r => r.tipo_registro === 'sintoma');
 
-  // Hora actual en Argentina (0-23)
-  const horaActual = parseInt(new Date().toLocaleString('es-AR', {
-    timeZone: 'America/Argentina/Buenos_Aires',
-    hour: '2-digit',
-    hour12: false
-  }).split(':')[0], 10);
-
-  // Día cerrado si tiene cena registrada
+  const horaActual = horaActualArgentina();
   const diaCerrado = cena;
 
-  // ── VENTANAS HORARIAS DURAS ──────────────────────────────────────────────
-  // La lógica vive acá, no en el prompt.
-  // El modelo solo redacta — el código decide si hay algo para preguntar.
-  //
-  // Ventanas:
-  //   Antes de 12:00  → sueño, entrenamiento (en ese orden)
-  //   12:00 – 15:59   → almuerzo
-  //   16:00 – 19:59   → merienda
-  //   20:00 en adelante → cena
-  //   21:00 en adelante + cena registrada → cierre del día (trigger_checkin)
-  //
-  // Si ninguna ventana está abierta o todo está registrado → puede_preguntar = false
-
+  // Ventanas horarias:
+  //   <12:00          → sueño (si no se registró)
+  //   12:00–15:59     → almuerzo
+  //   16:00–19:59     → merienda
+  //   ≥20:00          → cena
+  // Entrenamiento NO tiene ventana automática — cada uno entrena en su momento.
   let proximoMomento = null;
-
   if (!diaCerrado) {
-    if (horaActual < 12) {
-      if (!sueno) proximoMomento = 'sueno';
-      // Entrenamiento no tiene ventana automática — cada persona entrena en distinto momento.
-      // Si el usuario entrenó, lo registra. Sabi no pregunta proactivamente.
-    } else if (horaActual >= 12 && horaActual < 16) {
-      if (!almuerzo) proximoMomento = 'almuerzo';
-    } else if (horaActual >= 16 && horaActual < 20) {
-      if (!merienda) proximoMomento = 'merienda';
-    } else if (horaActual >= 20) {
-      if (!cena) proximoMomento = 'cena';
-    }
+    if (horaActual < 12 && !sueno) proximoMomento = 'sueno';
+    else if (horaActual >= 12 && horaActual < 16 && !almuerzo) proximoMomento = 'almuerzo';
+    else if (horaActual >= 16 && horaActual < 20 && !merienda) proximoMomento = 'merienda';
+    else if (horaActual >= 20 && !cena) proximoMomento = 'cena';
   }
 
-  // Determinar si puede preguntar y qué acción tomar
   const puedePreguntar = proximoMomento !== null;
+  const accionRecomendada = diaCerrado ? 'dia_cerrado'
+    : !puedePreguntar ? 'cerrar_breve'
+    : 'preguntar_proximo';
 
-  let accionRecomendada;
-  if (diaCerrado) {
-    accionRecomendada = 'dia_cerrado';
-  } else if (!puedePreguntar) {
-    accionRecomendada = 'cerrar_breve';
-  } else {
-    accionRecomendada = 'preguntar_proximo';
-  }
-
-  // Flag de check-in: se dispara si cena registrada, hora >= 20, no estamos en onboarding
-  // El campo trigger_checkin lo calcula procesarChat() porque tiene acceso al estado de onboarding.
-  // Acá solo calculamos si la condición temporal + registro se cumple.
   const condicionCheckin = cena && horaActual >= 20;
 
-  // Último registro del día
-  const ultimoRegistro = registrosHoy.length > 0
-    ? registrosHoy[registrosHoy.length - 1]
-    : null;
-  const ultimoTipo = ultimoRegistro
-    ? (ultimoRegistro.tipo_registro === 'comida' ? ultimoRegistro.comida_momento : ultimoRegistro.tipo_registro)
-    : null;
-
-  // Armar texto estructurado para el prompt
-  const fecha = getFechaArgentina();
+  const fecha = fechaArgentinaYMD();
   let estadoTexto = `ESTADO DEL DÍA (${fecha}):\n`;
   estadoTexto += `Hora actual: ${horaActual}:00 (Argentina)\n`;
-  estadoTexto += `Sueño registrado: ${sueno ? 'sí' : 'no'}\n`;
-  estadoTexto += `Entrenamiento registrado: ${entrenamiento ? 'sí' : 'no'}\n`;
+  estadoTexto += `Sueño de hoy registrado: ${sueno ? 'sí' : 'no'}\n`;
   estadoTexto += `Almuerzo registrado: ${almuerzo ? 'sí' : 'no'}\n`;
   estadoTexto += `Merienda registrada: ${merienda ? 'sí' : 'no'}\n`;
   estadoTexto += `Cena registrada: ${cena ? 'sí' : 'no'}\n`;
-  estadoTexto += `Energía/estado registrado: ${energia ? 'sí' : 'no'}\n`;
-  estadoTexto += `Síntomas registrados: ${sintomas ? 'sí' : 'no'}\n`;
-  if (ultimoTipo) estadoTexto += `Último registro: ${ultimoTipo}\n`;
   estadoTexto += `Día cerrado: ${diaCerrado ? 'sí' : 'no'}\n`;
   estadoTexto += `Próximo momento habilitado: ${proximoMomento || 'ninguno'}\n`;
   estadoTexto += `Puede preguntar: ${puedePreguntar ? 'sí' : 'no'}\n`;
   estadoTexto += `Acción recomendada: ${accionRecomendada}\n`;
-  estadoTexto += `\nREGLA ABSOLUTA: Si "Puede preguntar: no" — no hagas ninguna pregunta. Cerrá con algo breve y cálido. Si "Acción recomendada: dia_cerrado" — terminá con "Buen descanso." o "Buenas noches, [nombre]." sin excepciones. Si "Acción recomendada: preguntar_proximo" — preguntá solo por "${proximoMomento || ''}".`;
+  estadoTexto += `\nREGLA: `;
+  if (diaCerrado) {
+    estadoTexto += `El día está cerrado. Terminá con algo cálido y breve. Sin preguntas bajo ninguna circunstancia.`;
+  } else if (!puedePreguntar) {
+    estadoTexto += `No hay próximo momento habilitado. Respondé sin hacer preguntas sobre el día.`;
+  } else {
+    estadoTexto += `Si vas a preguntar algo, que sea SOLO sobre "${proximoMomento}". Una sola pregunta.`;
+  }
 
   return {
     texto: estadoTexto,
@@ -893,25 +939,9 @@ async function armarEstadoDia(usuarioId) {
   };
 }
 
-// ─── GUARDRAIL POST-RESPUESTA ────────────────────────────────────────────────
-// Si el código dice que no se puede preguntar, y el modelo igual preguntó,
-// el guardrail reemplaza la respuesta por una frase segura.
-// El modelo redacta. El código decide si la respuesta es válida.
-
-// Guardrail removido — la lógica conversacional vive en el prompt y el estado del día.
-// El código gobierna memoria, registros e insights. El modelo gobierna la conversación.
-
-// ─── RESPUESTA CON IMÁGENES ───────────────────────────────────────────────────
-//
-// Cuando llegan imágenes + texto largo, se hacen DOS llamadas internas:
-//   1. Extracción de datos de la imagen (ya existente en extraerRegistros)
-//   2. Respuesta conversacional con el contexto completo + datos extraídos
-//
-// El usuario recibe UN SOLO mensaje final.
-// Si la imagen falla, Sabi responde con el texto y avisa que no pudo leer la imagen.
+// ─── RESPUESTA CON IMÁGENES ──────────────────────────────────────────────────
 
 async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenes) {
-  // Construir contenido multimodal con imagen(es) + texto
   const contenidoImagen = [];
   for (const img of imagenes) {
     contenidoImagen.push({
@@ -925,28 +955,25 @@ async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje
   });
 
   try {
-    // Llamada con timeout de 30s — imágenes pesadas pueden tardar más que texto
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('timeout_imagen')), 30000)
     );
 
     const response = await Promise.race([
       anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
+        model: MODELO,
         max_tokens: 500,
         system: systemFinal,
         messages: [...mensajesPrevios.slice(0, -1), { role: 'user', content: contenidoImagen }],
       }),
       timeoutPromise
     ]);
-
     return response;
   } catch (error) {
     if (error.message === 'timeout_imagen') {
       console.error('Timeout procesando imagen — respondiendo sin imagen');
-      // Fallback: responder solo con el texto, sin imagen
       return await anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
+        model: MODELO,
         max_tokens: 500,
         system: systemFinal + '\n\nADVERTENCIA: No se pudo procesar la imagen adjunta. Respondé al mensaje de texto e informale al usuario que no pudiste leer la imagen — pedile que la reenvíe sola o en mejor calidad.',
         messages: mensajesPrevios,
@@ -956,7 +983,7 @@ async function generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje
   }
 }
 
-// ─── RESUMEN SEMANAL ──────────────────────────────────────────────────────────
+// ─── RESUMEN SEMANAL ─────────────────────────────────────────────────────────
 
 async function generarResumenSemanal(usuarioId) {
   const hace7dias = new Date();
@@ -967,10 +994,7 @@ async function generarResumenSemanal(usuarioId) {
     .select('*')
     .eq('usuario_id', usuarioId);
 
-  const registros = (todos || []).filter(r => {
-    const fechaRef = new Date(r.fecha_evento || r.created_at);
-    return fechaRef >= hace7dias;
-  });
+  const registros = (todos || []).filter(r => new Date(r.fecha_evento || r.created_at) >= hace7dias);
 
   const { data: user } = await supabase
     .from('usuarios')
@@ -985,7 +1009,7 @@ async function generarResumenSemanal(usuarioId) {
     .single();
 
   const diasConDatosEstaSemana = new Set(
-    registros.map(r => new Date(r.fecha_evento || r.created_at).toISOString().split('T')[0])
+    registros.map(r => fechaArgentinaYMD(new Date(r.fecha_evento || r.created_at)))
   ).size;
 
   if (diasConDatosEstaSemana < 3) {
@@ -998,7 +1022,7 @@ async function generarResumenSemanal(usuarioId) {
   const estados = registros.filter(r => r.tipo_registro === 'estado');
   const sintomas = registros.filter(r => r.tipo_registro === 'sintoma');
 
-  let datosResumen = `DATOS DE LA SEMANA (últimos 7 días):\n\n`;
+  let datosResumen = 'DATOS DE LA SEMANA (últimos 7 días):\n\n';
 
   if (suenos.length > 0) {
     const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
@@ -1068,7 +1092,7 @@ Estructura en prosa continua:
 5. Una sola sugerencia concreta para la semana siguiente`;
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-5',
+    model: MODELO,
     max_tokens: 600,
     system: SABI_RESUMEN_SYSTEM,
     messages: [{ role: 'user', content: promptResumen }]
@@ -1078,23 +1102,17 @@ Estructura en prosa continua:
 }
 
 // ─── HÁBITOS ─────────────────────────────────────────────────────────────────
-//
-// Tipos de hábito y su umbral de inactivación:
-//   Frecuentes (entrenamiento, sueño, comida, energía) → 14 días sin detectarse → inactivo
-//   Clínicos (controles, medicación, síntomas) → no usan umbral automático
-//
-// Ciclo de vida: activo → inactivo → reactivado
-// Si un hábito inactivo reaparece con evidencia, se reactiva manteniendo historial.
 
 const HABITOS_FRECUENTES = [
   'entreno_ayunas_recurrente', 'fuerza_alta_adherencia', 'sueno_consistente',
   'sueno_irregular', 'cena_tardia_recurrente',
-  'energia_baja_lunes', 'energia_baja_martes', 'energia_baja_miércoles',
-  'energia_baja_jueves', 'energia_baja_viernes', 'energia_baja_sábado', 'energia_baja_domingo'
+  'energia_baja_lunes', 'energia_baja_martes', 'energia_baja_miercoles',
+  'energia_baja_jueves', 'energia_baja_viernes', 'energia_baja_sabado', 'energia_baja_domingo'
 ];
 
+const DIAS_SEMANA_SIN_ACENTOS = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
+
 async function habitoExiste(usuarioId, tipoHabito) {
-  // Busca hábito activo O inactivo/reactivado para manejar el ciclo completo
   const { data } = await supabase
     .from('habitos_usuario')
     .select('id, estado, confianza, evidencia_json, cantidad_reactivaciones, primera_deteccion')
@@ -1112,7 +1130,6 @@ async function upsertHabito(usuarioId, tipoHabito, descripcion, evidencia) {
 
   if (existente) {
     if (existente.estado === 'inactivo') {
-      // Reactivar — mantener historial, incrementar contador
       const reactivaciones = (existente.cantidad_reactivaciones || 0) + 1;
       await supabase
         .from('habitos_usuario')
@@ -1128,14 +1145,12 @@ async function upsertHabito(usuarioId, tipoHabito, descripcion, evidencia) {
         .eq('id', existente.id);
       console.log(`Hábito reactivado: ${tipoHabito} (reactivación #${reactivaciones})`);
     } else {
-      // Activo o reactivado — solo actualizar evidencia
       await supabase
         .from('habitos_usuario')
         .update({ descripcion, evidencia_json: evidencia, ultima_actualizacion: ahora })
         .eq('id', existente.id);
     }
   } else {
-    // Nuevo hábito
     await supabase.from('habitos_usuario').insert([{
       usuario_id: usuarioId,
       tipo_habito: tipoHabito,
@@ -1151,8 +1166,6 @@ async function upsertHabito(usuarioId, tipoHabito, descripcion, evidencia) {
   }
 }
 
-// Corre después de detectarHabitos — marca como inactivos los hábitos frecuentes
-// que no se detectaron en los últimos 14 días.
 async function inactivarHabitosVencidos(usuarioId) {
   try {
     const hace14dias = new Date();
@@ -1168,8 +1181,7 @@ async function inactivarHabitosVencidos(usuarioId) {
     if (!habitos || habitos.length === 0) return;
 
     for (const h of habitos) {
-      const ultimaActualizacion = new Date(h.ultima_actualizacion);
-      if (ultimaActualizacion < hace14dias) {
+      if (new Date(h.ultima_actualizacion) < hace14dias) {
         await supabase
           .from('habitos_usuario')
           .update({
@@ -1188,7 +1200,6 @@ async function inactivarHabitosVencidos(usuarioId) {
 
 async function detectarHabitos(usuarioId) {
   try {
-    // Traer registros de los últimos 30 días para detección de hábitos
     const hace30dias = new Date();
     hace30dias.setDate(hace30dias.getDate() - 30);
 
@@ -1199,41 +1210,35 @@ async function detectarHabitos(usuarioId) {
 
     if (!todos || todos.length === 0) return;
 
-    const registros = todos.filter(r => {
-      const fechaRef = new Date(r.fecha_evento || r.created_at);
-      return fechaRef >= hace30dias;
-    });
-
-    if (registros.length < 10) return; // Mínimo de datos para detectar hábitos
+    const registros = todos.filter(r => new Date(r.fecha_evento || r.created_at) >= hace30dias);
+    if (registros.length < 10) return;
 
     const entrenos = registros.filter(r => r.tipo_registro === 'entrenamiento');
     const suenos = registros.filter(r => r.tipo_registro === 'sueno');
     const comidas = registros.filter(r => r.tipo_registro === 'comida');
 
-    // ── HÁBITO: Entrena en ayunas ──────────────────────────────────────────
+    // ── Entrena en ayunas ─────────────────────────────────────────────────
     if (entrenos.length >= 5) {
-      const entrenosAyunas = entrenos.filter(r => r.entreno_ayunas === true);
-      const porcentajeAyunas = entrenosAyunas.length / entrenos.length;
-      if (porcentajeAyunas >= 0.6) {
+      const enAyunas = entrenos.filter(r => r.entreno_ayunas === true);
+      const porc = enAyunas.length / entrenos.length;
+      if (porc >= 0.6) {
         await upsertHabito(usuarioId, 'entreno_ayunas_recurrente',
-          `Entrena en ayunas en el ${Math.round(porcentajeAyunas * 100)}% de las sesiones registradas.`,
-          { sesiones_totales: entrenos.length, sesiones_ayunas: entrenosAyunas.length, porcentaje: porcentajeAyunas }
+          `Entrena en ayunas en el ${Math.round(porc * 100)}% de las sesiones registradas.`,
+          { sesiones_totales: entrenos.length, sesiones_ayunas: enAyunas.length, porcentaje: porc }
         );
       }
     }
 
-    // ── HÁBITO: Alta adherencia a fuerza ──────────────────────────────────
+    // ── Alta adherencia a fuerza (usando semana calendario Argentina) ─────
     if (entrenos.length >= 5) {
       const fuerza = entrenos.filter(r => r.entreno_tipo === 'fuerza');
       if (fuerza.length >= 3) {
-        // Calcular semanas únicas
         const semanas = new Set(fuerza.map(r => {
-          const d = new Date(r.fecha_evento || r.created_at);
-          const startOfWeek = new Date(d);
-          const fechaArgSemana = d.toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
-          const dArg = new Date(fechaArgSemana + 'T12:00:00-03:00');
-          startOfWeek.setDate(dArg.getDate() - dArg.getDay());
-          return startOfWeek.toISOString().split('T')[0];
+          const fechaArg = fechaArgentinaYMD(new Date(r.fecha_evento || r.created_at));
+          const dMediodia = new Date(fechaArg + 'T12:00:00-03:00');
+          const dia = dMediodia.getDay();
+          dMediodia.setDate(dMediodia.getDate() - dia);
+          return fechaArgentinaYMD(dMediodia);
         }));
         if (semanas.size >= 2) {
           await upsertHabito(usuarioId, 'fuerza_alta_adherencia',
@@ -1244,7 +1249,7 @@ async function detectarHabitos(usuarioId) {
       }
     }
 
-    // ── HÁBITO: Sueño consistente ──────────────────────────────────────────
+    // ── Sueño consistente ─────────────────────────────────────────────────
     if (suenos.length >= 5) {
       const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
       const buenas = calidades.filter(c => c >= 4).length;
@@ -1256,7 +1261,7 @@ async function detectarHabitos(usuarioId) {
       }
     }
 
-    // ── HÁBITO: Sueño irregular ────────────────────────────────────────────
+    // ── Sueño irregular ───────────────────────────────────────────────────
     if (suenos.length >= 5) {
       const calidades = suenos.filter(r => r.sueno_calidad !== null).map(r => r.sueno_calidad);
       const bajas = calidades.filter(c => c <= 2).length;
@@ -1268,13 +1273,12 @@ async function detectarHabitos(usuarioId) {
       }
     }
 
-    // ── HÁBITO: Cena tardía recurrente ────────────────────────────────────
+    // ── Cena tardía recurrente ────────────────────────────────────────────
     const cenas = comidas.filter(r => r.comida_momento === 'cena' && r.nota_libre);
     if (cenas.length >= 3) {
       const cenasTardias = cenas.filter(r => {
-        const hora = r.nota_libre?.match(/(\d{1,2}):(\d{2})/);
-        if (hora) return parseInt(hora[1]) >= 21;
-        return false;
+        const m = r.nota_libre?.match(/(\d{1,2}):(\d{2})/);
+        return m ? parseInt(m[1]) >= 21 : false;
       });
       if (cenasTardias.length / cenas.length >= 0.5) {
         await upsertHabito(usuarioId, 'cena_tardia_recurrente',
@@ -1284,28 +1288,24 @@ async function detectarHabitos(usuarioId) {
       }
     }
 
-    // ── HÁBITO: Energía baja un día específico de la semana ───────────────
+    // ── Energía baja en día específico (con día calculado en zona ARG) ────
     const registrosEnergia = registros.filter(r => r.energia !== null && r.energia <= 2);
     if (registrosEnergia.length >= 4) {
-      const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
       const conteoXDia = {};
       registrosEnergia.forEach(r => {
-        const fechaArgDia = new Date(r.fecha_evento || r.created_at)
-          .toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
-        const dia = new Date(fechaArgDia + 'T12:00:00-03:00').getDay();
+        const dia = diaSemanaArgentina(new Date(r.fecha_evento || r.created_at));
         conteoXDia[dia] = (conteoXDia[dia] || 0) + 1;
       });
-      // for...of para que el await se espere correctamente
-      for (const [dia, count] of Object.entries(conteoXDia)) {
+      for (const [diaIdx, count] of Object.entries(conteoXDia)) {
         if (count >= 2) {
-          await upsertHabito(usuarioId, `energia_baja_${diasSemana[dia]}`,
-            `Energía baja se repite los ${diasSemana[dia]} — detectado ${count} veces en los últimos 30 días.`,
-            { dia_semana: diasSemana[dia], ocurrencias: count }
+          const nombreDia = DIAS_SEMANA_SIN_ACENTOS[diaIdx];
+          await upsertHabito(usuarioId, `energia_baja_${nombreDia}`,
+            `Energía baja se repite los ${nombreDia} — detectado ${count} veces en los últimos 30 días.`,
+            { dia_semana: nombreDia, ocurrencias: count }
           );
         }
       }
     }
-
   } catch (error) {
     console.error('Error detectando hábitos:', error.message);
   }
@@ -1327,20 +1327,19 @@ async function armarContextoHabitos(usuarioId) {
   habitos.forEach(h => {
     texto += `- ${h.descripcion} (confianza: ${h.confianza})\n`;
   });
-  texto += 'Usá estos hábitos para personalizar observaciones y anticipar comportamientos — no para prescribir. IMPORTANTE: respondé siempre en texto plano, sin asteriscos, sin negrita, sin markdown de ningún tipo.';
+  texto += 'Usá estos hábitos para personalizar observaciones y anticipar comportamientos — no para prescribir.';
   return texto;
 }
 
 // ─── OBRA SOCIAL ─────────────────────────────────────────────────────────────
 
-// Detecta si el mensaje tiene intención de consulta sobre obra social
 function esMensajeObraSocial(mensaje) {
   if (!mensaje) return false;
   const keywords = [
     'cubre', 'cobertura', 'obra social', 'pami', 'osseg', 'osde', 'ioma', 'prepaga',
     'prestador', 'médico', 'medico', 'especialista', 'farmacia', 'farmac',
     'turno', 'autorización', 'autorizacion', 'receta', 'medicamento', 'remedios',
-    'laboratorio', 'análisis', 'análisis', 'ecografía', 'estudio', 'tomografía',
+    'laboratorio', 'análisis', 'ecografía', 'estudio', 'tomografía',
     'oftalmólogo', 'cardiólogo', 'traumatólogo', 'clínica', 'sanatorio',
     'internación', 'guardia', 'urgencia', 'traslado', 'ambulancia',
     'óptica', 'anteojos', 'audífono', 'prótesis', 'kinesiología',
@@ -1351,7 +1350,6 @@ function esMensajeObraSocial(mensaje) {
   return keywords.some(k => msj.includes(k));
 }
 
-// Extrae el nombre de la obra social del contexto_base del usuario
 function extraerObraSocial(contextoBase) {
   if (!contextoBase) return null;
   const ctx = contextoBase.toUpperCase();
@@ -1362,7 +1360,6 @@ function extraerObraSocial(contextoBase) {
   if (ctx.includes('MEDICUS')) return 'MEDICUS';
   if (ctx.includes('SWISS MEDICAL')) return 'SWISS MEDICAL';
   if (ctx.includes('GALENO')) return 'GALENO';
-  // Patrón genérico: buscar "Obra social: NOMBRE" o "NOMBRE (obra social)"
   const match = contextoBase.match(/obra social[:\s]+([A-Z][A-Za-z\s]+?)[\n\.,]/i);
   if (match) return match[1].trim().toUpperCase();
   return null;
@@ -1404,7 +1401,6 @@ async function consultarObraSocial(obraSocial) {
   }
 
   if (prestadores && prestadores.length > 0) {
-    // Agrupar por tipo
     const porTipo = {};
     prestadores.forEach(p => {
       if (!porTipo[p.tipo]) porTipo[p.tipo] = [];
@@ -1437,40 +1433,43 @@ async function consultarObraSocial(obraSocial) {
     });
   }
 
-  texto += '\nIMPORTANTE: Usá esta información para responder preguntas de cobertura y prestadores con contexto personal. Nunca inventes datos que no estén acá. Si falta información, decilo honestamente.';
-
+  texto += '\nUsá esta información para responder preguntas de cobertura y prestadores con contexto personal. Nunca inventes datos que no estén acá. Si falta información, decilo honestamente.';
   return texto;
 }
 
 // ─── ONBOARDING AUTOMÁTICO ───────────────────────────────────────────────────
+// Heurística sobre el historial — funciona con Daniel y Roberto. El cambio
+// respecto a versiones previas: el nombre se busca SOLO entre los mensajes
+// del usuario que vienen después de que Sabi preguntó "¿cómo te llamás?"
+// o equivalente. Antes podía agarrar un "hola" como nombre.
 
-// Extrae datos del onboarding del historial de conversaciones
 function extraerDatosOnboarding(historial) {
   if (!historial || historial.length === 0) return {};
 
-  const texto = historial
-    .map(h => `${h.rol}: ${h.mensaje}`)
-    .join('\n')
-    .toLowerCase();
-
   const datos = {};
 
-  // Detectar nombre — buscar en respuestas del usuario después de que Sabi preguntó el nombre
-  const mensajesUsuario = historial.filter(h => h.rol === 'user').map(h => h.mensaje);
-
-  // Nombre: primera respuesta corta del usuario (1-3 palabras, no una oración)
-  for (const msg of mensajesUsuario) {
-    const limpio = msg.trim();
-    const palabras = limpio.split(/\s+/);
-    if (palabras.length >= 1 && palabras.length <= 4 && !limpio.includes('?') && !limpio.includes(',')) {
-      // Probable nombre
-      if (!datos.nombre && /^[a-záéíóúüñA-ZÁÉÍÓÚÜÑ\s]+$/.test(limpio)) {
+  // Detectar nombre: buscar el mensaje del assistant que pregunta el nombre,
+  // y tomar la primera respuesta corta del usuario que viene después.
+  let preguntoNombre = false;
+  for (const h of historial) {
+    if (h.rol === 'assistant' && /nombre|llamás|cómo te llamas|cómo te llaman/i.test(h.mensaje)) {
+      preguntoNombre = true;
+      continue;
+    }
+    if (preguntoNombre && h.rol === 'user' && !datos.nombre) {
+      const limpio = h.mensaje.trim();
+      const palabras = limpio.split(/\s+/);
+      if (palabras.length >= 1 && palabras.length <= 4 &&
+          !limpio.includes('?') && !limpio.includes(',') &&
+          /^[a-záéíóúüñA-ZÁÉÍÓÚÜÑ\s]+$/.test(limpio)) {
         datos.nombre = limpio.split(' ').map(p => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join(' ');
+        break;
       }
     }
   }
 
-  // Edad: buscar número entre 10 y 110 en mensajes del usuario
+  // Edad: número entre 10 y 110 en mensajes del usuario
+  const mensajesUsuario = historial.filter(h => h.rol === 'user').map(h => h.mensaje);
   for (const msg of mensajesUsuario) {
     const match = msg.match(/\b(\d{2,3})\b/);
     if (match) {
@@ -1481,7 +1480,7 @@ function extraerDatosOnboarding(historial) {
     }
   }
 
-  // Objetivo: último mensaje largo del usuario (más de 10 palabras) que no sea nombre ni edad
+  // Objetivo: último mensaje largo del usuario
   for (const msg of [...mensajesUsuario].reverse()) {
     if (msg.split(/\s+/).length > 6 && !datos.objetivo) {
       datos.objetivo = msg.trim();
@@ -1492,16 +1491,12 @@ function extraerDatosOnboarding(historial) {
   return datos;
 }
 
-async function procesarOnboarding(userId, estado, historial, respuestaSabi) {
+async function procesarOnboarding(userId, estado, historial) {
   try {
     const stage = estado.onboarding_stage;
-
-    // Ya completo — no hacer nada
     if (stage === 'completo') return;
 
     const datos = extraerDatosOnboarding(historial);
-
-    // Determinar nuevo stage según lo que tenemos
     let nuevoStage = stage;
     const updates = {};
 
@@ -1516,23 +1511,17 @@ async function procesarOnboarding(userId, estado, historial, respuestaSabi) {
     }
 
     if (datos.nombre && datos.edad && datos.objetivo) {
-      nuevoStage = 'completo';
-      updates.nombre = datos.nombre;
-      // Detectar si es adulto mayor
       const modoUsuario = datos.edad >= 65 ? 'adulto_mayor' : 'adulto_activo';
-      // Construir contexto_base básico
       const contextoBase = `Nombre: ${datos.nombre}
 Edad: ${datos.edad} años
 Objetivo principal: ${datos.objetivo}
 Onboarding: completado automáticamente`;
 
-      // Actualizar usuario
       await supabase
         .from('usuarios')
-        .update({ nombre: updates.nombre, contexto_base: contextoBase })
+        .update({ nombre: datos.nombre, contexto_base: contextoBase })
         .eq('id', userId);
 
-      // Actualizar estado
       await supabase
         .from('estado_usuario')
         .update({ onboarding_stage: 'completo', modo_usuario: modoUsuario })
@@ -1542,12 +1531,10 @@ Onboarding: completado automáticamente`;
       return;
     }
 
-    // Actualizar stage y nombre si cambió
     if (nuevoStage !== stage) {
-      const updateEstado = { onboarding_stage: nuevoStage };
       await supabase
         .from('estado_usuario')
-        .update(updateEstado)
+        .update({ onboarding_stage: nuevoStage })
         .eq('usuario_id', userId);
 
       if (updates.nombre) {
@@ -1557,214 +1544,225 @@ Onboarding: completado automáticamente`;
           .eq('id', userId);
       }
     }
-
   } catch (error) {
     console.error('Error procesando onboarding:', error.message);
   }
 }
 
-// ─── MAIN HANDLER ────────────────────────────────────────────────────────────
+// ─── GENERAR RESPUESTA — separado del transporte HTTP ────────────────────────
+// Esta función contiene TODA la lógica conversacional. Recibe usuario+mensaje,
+// devuelve { respuesta, ...metadata }. No toca req/res. Eso permite que el
+// mismo motor sirva tanto al endpoint web (/chat) como al webhook de WhatsApp
+// cuando se conecte — sin duplicar lógica.
 
-app.get('/', (req, res) => {
-  res.json({ status: 'Sabi está vivo', version: '3.5.1' });
-});
+async function generarRespuesta(usuario, mensaje, imagenes) {
+  // 1. Resolver/crear usuario y estado
+  let { data: user } = await supabase
+    .from('usuarios')
+    .select('*')
+    .eq('telefono', usuario)
+    .single();
 
-async function procesarChat(usuario, mensaje, res, imagenes) {
-  try {
-    let { data: user } = await supabase
+  if (!user) {
+    const { data: newUser } = await supabase
       .from('usuarios')
-      .select('*')
-      .eq('telefono', usuario)
+      .insert([{ telefono: usuario, nombre: usuario }])
+      .select()
       .single();
+    user = newUser;
+  }
 
-    if (!user) {
-      const { data: newUser } = await supabase
-        .from('usuarios')
-        .insert([{ telefono: usuario, nombre: usuario }])
-        .select()
-        .single();
-      user = newUser;
-    }
+  let { data: estado } = await supabase
+    .from('estado_usuario')
+    .select('*')
+    .eq('usuario_id', user.id)
+    .single();
 
-    let { data: estado } = await supabase
+  if (!estado) {
+    const { data: nuevoEstado } = await supabase
       .from('estado_usuario')
-      .select('*')
-      .eq('usuario_id', user.id)
+      .insert([{ usuario_id: user.id, onboarding_stage: 'nuevo', modo_usuario: 'general', madurez_sabi: 'escucha' }])
+      .select()
       .single();
+    estado = nuevoEstado;
+  }
 
-    if (!estado) {
-      const { data: nuevoEstado } = await supabase
-        .from('estado_usuario')
-        .insert([{ usuario_id: user.id, onboarding_stage: 'nuevo', modo_usuario: 'general', madurez_sabi: 'escucha' }])
-        .select()
-        .single();
-      estado = nuevoEstado;
+  const enOnboarding = estado.onboarding_stage !== 'completo';
+  const esAperturaDia = mensaje && mensaje.startsWith('APERTURA_DIA:');
+  const esReapertura = mensaje === 'reapertura_del_dia';
+  const esMensajeSistema = esAperturaDia || esReapertura;
+  const tieneImagenes = imagenes && imagenes.length > 0;
+
+  const imagenesValidas = tieneImagenes
+    ? imagenes.filter(img => MEDIA_TYPES_VALIDOS.includes(img.tipo)).slice(0, 5)
+    : null;
+
+  // 2. Idempotencia — solo para mensajes reales del usuario (no sistema, no onboarding)
+  let yaProcesado = null;
+  let hashMensaje = null;
+  if (!enOnboarding && !esMensajeSistema && mensaje && mensaje.length > 0) {
+    hashMensaje = calcularHashMensaje(user.id, mensaje);
+    yaProcesado = await mensajeYaProcesado(user.id, hashMensaje, 10);
+    if (yaProcesado) {
+      console.log(`Mensaje duplicado detectado (hash ${hashMensaje.slice(0, 8)}) — devolviendo respuesta vacía`);
+      // Devolver una respuesta neutra que no genere otra inserción en conversaciones.
+      // El cliente recibirá esto y no debería volver a mostrar nada al usuario.
+      return {
+        respuesta: '',
+        usuario: user.nombre,
+        onboarding: false,
+        modo: estado.modo_usuario,
+        madurez: estado.madurez_sabi,
+        registros_guardados: 0,
+        duplicado: true
+      };
     }
+  }
 
-    const enOnboarding = estado.onboarding_stage !== 'completo';
-    const esAperturaDia = mensaje && mensaje.startsWith('APERTURA_DIA:');
-    const esReapertura = mensaje === 'reapertura_del_dia';
-    const esMensajeSistema = esAperturaDia || esReapertura;
-    const tieneImagenes = imagenes && imagenes.length > 0;
+  // 3. Extracción de registros (solo si no estamos en onboarding ni es sistema)
+  let registrosExtraidos = [];
+  let cantidadGuardada = 0;
+  let resultado = null;
 
-    // Validar media types de imágenes
-    const imagenesValidas = tieneImagenes
-      ? imagenes.filter(img => MEDIA_TYPES_VALIDOS.includes(img.tipo)).slice(0, 5)
-      : null;
-
-    let registrosExtraidos = [];
-    let cantidadGuardada = 0;
-    let errorExtraccion = false;
-    let resultado = null;
-
-    if (!enOnboarding && !esMensajeSistema) {
-      // Armar estado operativo mínimo para el extractor — solo qué momentos ya están registrados
-      // Esto reduce duplicados y errores de clasificación en mensajes ambiguos
-      const estadoOperativo = await (async () => {
-        try {
-          const inicioHoyExt = getInicioHoyArgentina();
-          const inicioMananaExt = getInicioMananaArgentina();
-          const { data: regHoy } = await supabase
-            .from('registros')
-            .select('tipo_registro, comida_momento')
-            .eq('usuario_id', user.id)
-            .gte('fecha_evento', inicioHoyExt.toISOString())
-            .lt('fecha_evento', inicioMananaExt.toISOString());
-          const rh = regHoy || [];
-          const tieneSueno = rh.some(r => r.tipo_registro === 'sueno');
-          const tieneEntreno = rh.some(r => r.tipo_registro === 'entrenamiento');
-          const tieneAlmuerzo = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'almuerzo');
-          const tieneMerienda = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'merienda');
-          const tieneCena = rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'cena');
-          return `[Registros de hoy: sueno=${tieneSueno}, entrenamiento=${tieneEntreno}, almuerzo=${tieneAlmuerzo}, merienda=${tieneMerienda}, cena=${tieneCena}. Usá esto solo para evitar duplicados y clasificar momentos ambiguos. No bloquees registros legítimos.]`;
-        } catch { return ''; }
-      })();
-
-      resultado = await extraerRegistros(mensaje, imagenesValidas, estadoOperativo);
-      registrosExtraidos = resultado.registros;
-      errorExtraccion = resultado.error;
-      cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
-    }
-
-    if (cantidadGuardada > 0) {
-      try {
-        await evaluarSenales(user.id);
-        await actualizarMadurez(user.id);
-        await detectarHabitos(user.id);
-        await inactivarHabitosVencidos(user.id);
-      } catch (error) {
-        console.error('Error post-registro:', error.message);
-      }
-    }
-
-    // Clasificar feedback de insight en segundo plano si el usuario respondió a uno reciente
-    if (!enOnboarding && !esMensajeSistema && mensaje && mensaje.length > 2) {
-      detectarYClasificarFeedback(user.id, mensaje);
-    }
-
-    const { data: estadoActualizado } = await supabase
-      .from('estado_usuario')
-      .select('*')
-      .eq('usuario_id', user.id)
-      .single();
-    const estadoFinal = estadoActualizado || estado;
-
-    const limiteHistorial = esAperturaDia ? 0 : 20;
-    const { data: historial } = limiteHistorial > 0 ? await supabase
-      .from('conversaciones')
-      .select('rol, mensaje, fecha')
-      .eq('usuario_id', user.id)
-      .order('fecha', { ascending: false })
-      .limit(limiteHistorial) : { data: [] };
-
-    const hoy = new Date();
-    const en365dias = new Date();
-    en365dias.setDate(hoy.getDate() + 365);
-
-    const { data: eventosProximos } = await supabase
-      .from('eventos')
-      .select('*')
-      .eq('usuario_id', user.id)
-      .eq('activo', true)
-      .gte('fecha_evento', hoy.toISOString())
-      .lte('fecha_evento', en365dias.toISOString());
-
-    const { data: insightsPendientes } = await supabase
-      .from('insights')
-      .select('id, tipo_insight, regla_origen, confianza, contador_exposiciones')
-      .eq('usuario_id', user.id)
-      .eq('estado', 'pendiente')
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    // Filtrar insights que no superaron 3 exposiciones
-    // El contador se incrementa solo cuando el modelo realmente usa el insight (via tag INSIGHT_ID)
-    const insightsFiltrados = (insightsPendientes || []).filter(i => (i.contador_exposiciones || 0) < 3);
-
-    const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
-    const estadoDiaResult = !enOnboarding ? await armarEstadoDia(user.id) : null;
-    const estadoDia = estadoDiaResult ? estadoDiaResult.texto : null;
-    const condicionCheckin = estadoDiaResult ? estadoDiaResult.condicionCheckin : false;
-    const contextoHabitos = !enOnboarding ? await armarContextoHabitos(user.id) : null;
-
-    // Determinar si corresponde disparar el check-in
-    // No disparar si ya fue completado hoy NI si ya fue ofrecido hoy
-    let triggerCheckin = false;
-    if (!enOnboarding && !esMensajeSistema && condicionCheckin) {
-      const inicioHoyCheck = getInicioHoyArgentina();
-      const inicioMananaCheck = getInicioMananaArgentina();
-
-      // Verificar check-in completado hoy
-      const { data: checkinCompletadoHoy } = await supabase
+  if (!enOnboarding && !esMensajeSistema) {
+    // Estado operativo mínimo para el extractor — ayuda a evitar duplicados
+    let estadoOperativo = '';
+    try {
+      const { data: regHoy } = await supabase
         .from('registros')
-        .select('id')
+        .select('tipo_registro, comida_momento')
         .eq('usuario_id', user.id)
-        .eq('origen', 'checkin')
-        .gte('fecha_evento', inicioHoyCheck.toISOString())
-        .lt('fecha_evento', inicioMananaCheck.toISOString())
-        .limit(1);
-      const yaCompleto = checkinCompletadoHoy && checkinCompletadoHoy.length > 0;
-
-      // Verificar si ya fue ofrecido hoy (aunque no completado)
-      const yaOfrecido = estadoFinal.ultimo_checkin_ofrecido_at
-        ? new Date(estadoFinal.ultimo_checkin_ofrecido_at) >= inicioHoyCheck
-        : false;
-
-      triggerCheckin = !yaCompleto && !yaOfrecido;
+        .gte('fecha_evento', inicioHoyArgentina().toISOString())
+        .lt('fecha_evento', inicioMananaArgentina().toISOString());
+      const rh = regHoy || [];
+      const flags = {
+        sueno: rh.some(r => r.tipo_registro === 'sueno'),
+        entrenamiento: rh.some(r => r.tipo_registro === 'entrenamiento'),
+        almuerzo: rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'almuerzo'),
+        merienda: rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'merienda'),
+        cena: rh.some(r => r.tipo_registro === 'comida' && r.comida_momento === 'cena')
+      };
+      estadoOperativo = `[Registros de hoy: sueno=${flags.sueno}, entrenamiento=${flags.entrenamiento}, almuerzo=${flags.almuerzo}, merienda=${flags.merienda}, cena=${flags.cena}. Usá esto solo para evitar duplicados. No bloquees registros legítimos.]`;
+    } catch (e) {
+      console.error('Error armando estado operativo:', e.message);
     }
 
-    // Consulta obra social solo si el mensaje lo amerita y el usuario tiene una cargada
-    let contextoObraSocial = null;
-    if (!enOnboarding && !esMensajeSistema && esMensajeObraSocial(mensaje)) {
-      const obraSocial = extraerObraSocial(user.contexto_base);
-      if (obraSocial) {
-        contextoObraSocial = await consultarObraSocial(obraSocial);
-      }
+    resultado = await extraerRegistros(mensaje, imagenesValidas, estadoOperativo);
+    registrosExtraidos = resultado.registros;
+    cantidadGuardada = await guardarRegistros(user.id, mensaje, registrosExtraidos);
+  }
+
+  // 4. Post-registro: actualizar señales, madurez, hábitos
+  if (cantidadGuardada > 0) {
+    try {
+      await evaluarSenales(user.id);
+      await actualizarMadurez(user.id);
+      await detectarHabitos(user.id);
+      await inactivarHabitosVencidos(user.id);
+    } catch (error) {
+      console.error('Error post-registro:', error.message);
     }
+  }
 
-    let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
+  // 5. Clasificar feedback de insight en segundo plano (no await)
+  if (!enOnboarding && !esMensajeSistema && mensaje && mensaje.length > 2) {
+    detectarYClasificarFeedback(user.id, mensaje);
+  }
 
-    if (!enOnboarding) {
-      const fechaCompleta = new Date().toLocaleString('es-AR', {
-        timeZone: 'America/Argentina/Buenos_Aires',
-        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-      });
-      systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompleta} (hora Argentina). Usá esta fecha y hora para distinguir qué pasó hoy, qué pasó ayer, y qué momento del día es ahora.`;
-    }
+  // 6. Releer estado por si cambió (madurez)
+  const { data: estadoActualizado } = await supabase
+    .from('estado_usuario')
+    .select('*')
+    .eq('usuario_id', user.id)
+    .single();
+  const estadoFinal = estadoActualizado || estado;
 
-    if (!enOnboarding && user.contexto_base) {
-      systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
-    }
+  // 7. Historial conversacional
+  const limiteHistorial = esAperturaDia ? 0 : 20;
+  const { data: historial } = limiteHistorial > 0 ? await supabase
+    .from('conversaciones')
+    .select('rol, mensaje, fecha')
+    .eq('usuario_id', user.id)
+    .order('fecha', { ascending: false })
+    .limit(limiteHistorial) : { data: [] };
 
-    if (!enOnboarding && estadoFinal.modo_usuario) {
+  // 8. Eventos próximos
+  const hoy = new Date();
+  const en365dias = new Date();
+  en365dias.setDate(hoy.getDate() + 365);
+
+  const { data: eventosProximos } = await supabase
+    .from('eventos')
+    .select('*')
+    .eq('usuario_id', user.id)
+    .eq('activo', true)
+    .gte('fecha_evento', hoy.toISOString())
+    .lte('fecha_evento', en365dias.toISOString());
+
+  // 9. Insights pendientes (filtrados por exposiciones)
+  const { data: insightsPendientes } = await supabase
+    .from('insights')
+    .select('id, tipo_insight, regla_origen, confianza, contador_exposiciones')
+    .eq('usuario_id', user.id)
+    .eq('estado', 'pendiente')
+    .order('created_at', { ascending: false })
+    .limit(10);
+
+  const insightsFiltrados = (insightsPendientes || []).filter(i => (i.contador_exposiciones || 0) < 3);
+
+  // 10. Bloques de contexto
+  const contextoReciente = !enOnboarding ? await armarContextoReciente(user.id) : null;
+  const estadoDiaResult = !enOnboarding ? await armarEstadoDia(user.id) : null;
+  const estadoDia = estadoDiaResult ? estadoDiaResult.texto : null;
+  const condicionCheckin = estadoDiaResult ? estadoDiaResult.condicionCheckin : false;
+  const contextoHabitos = !enOnboarding ? await armarContextoHabitos(user.id) : null;
+
+  // 11. Trigger de check-in (cena registrada + hora >= 20 + no completado/ofrecido hoy)
+  let triggerCheckin = false;
+  if (!enOnboarding && !esMensajeSistema && condicionCheckin) {
+    const inicioHoyCheck = inicioHoyArgentina();
+    const inicioMananaCheck = inicioMananaArgentina();
+
+    const { data: checkinHoy } = await supabase
+      .from('registros')
+      .select('id')
+      .eq('usuario_id', user.id)
+      .eq('origen', 'checkin')
+      .gte('fecha_evento', inicioHoyCheck.toISOString())
+      .lt('fecha_evento', inicioMananaCheck.toISOString())
+      .limit(1);
+    const yaCompleto = checkinHoy && checkinHoy.length > 0;
+
+    const yaOfrecido = estadoFinal.ultimo_checkin_ofrecido_at
+      ? new Date(estadoFinal.ultimo_checkin_ofrecido_at) >= inicioHoyCheck
+      : false;
+
+    triggerCheckin = !yaCompleto && !yaOfrecido;
+  }
+
+  // 12. Obra social
+  let contextoObraSocial = null;
+  if (!enOnboarding && !esMensajeSistema && esMensajeObraSocial(mensaje)) {
+    const obraSocial = extraerObraSocial(user.contexto_base);
+    if (obraSocial) contextoObraSocial = await consultarObraSocial(obraSocial);
+  }
+
+  // 13. Construcción del system prompt final
+  let systemFinal = enOnboarding ? SABI_ONBOARDING : SABI_SYSTEM;
+
+  if (!enOnboarding) {
+    systemFinal += `\n\nCONTEXTO TEMPORAL: Ahora son las ${fechaCompletaArgentina()} (hora Argentina). Usá esta fecha y hora para distinguir qué pasó hoy, qué pasó ayer, y qué momento del día es ahora.`;
+
+    if (user.contexto_base) systemFinal += `\n\nPERFIL DEL USUARIO:\n${user.contexto_base}`;
+
+    if (estadoFinal.modo_usuario) {
       systemFinal += `\n\nMODO: ${estadoFinal.modo_usuario}`;
       if (estadoFinal.modo_usuario === 'adulto_mayor') {
-        systemFinal += '\nEste usuario es un adulto mayor. Tono más simple, más cálido, más pausado. Sin tecnicismos sin explicar.';
+        systemFinal += '\nEste usuario es un adulto mayor. Tono más simple, más cálido, más pausado.';
       }
     }
 
-    if (!enOnboarding && estadoFinal.madurez_sabi) {
+    if (estadoFinal.madurez_sabi) {
       const madurezTexto = {
         'escucha': 'Estás en etapa de escucha — primeros días. Acusá recibo, respondé consultas directas, no des insights proactivos todavía.',
         'tendencia_temprana': 'Tenés una semana de datos. Podés señalar tendencias tentativas con honestidad sobre la certeza.',
@@ -1774,49 +1772,37 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
       systemFinal += `\n\nETAPA ACTUAL: ${madurezTexto[estadoFinal.madurez_sabi]}`;
     }
 
-    if (!enOnboarding && contextoReciente) {
-      systemFinal += `\n\n${contextoReciente}`;
+    if (contextoReciente) systemFinal += `\n\n${contextoReciente}`;
+    if (contextoHabitos) systemFinal += `\n\n${contextoHabitos}`;
+    if (estadoDia) systemFinal += `\n\n${estadoDia}`;
+
+    // Resumen humano de lo recién registrado — en lugar de JSON dump
+    if (registrosExtraidos.length > 0) {
+      const resumen = resumirRegistrosGuardados(registrosExtraidos);
+      systemFinal += `\n\nREGISTRÉ EN ESTE MENSAJE: ${resumen}. Acusá recibo breve y natural — no repitas los datos uno por uno, no enumerés.`;
     }
 
-    if (!enOnboarding && contextoHabitos) {
-      systemFinal += `\n\n${contextoHabitos}`;
-    }
-
-    if (!enOnboarding && estadoDia) {
-      systemFinal += `\n\n${estadoDia}`;
-    }
-
-    if (!enOnboarding && registrosExtraidos.length > 0) {
-      systemFinal += `\n\nDATOS REGISTRADOS EN ESTE MENSAJE (${registrosExtraidos.length} registro/s):\n${JSON.stringify(registrosExtraidos, null, 2)}`;
-    }
-
-    // Advertencia si el usuario intentó registrar pero no se guardó nada
-    if (!enOnboarding && !esMensajeSistema && cantidadGuardada === 0 && (errorExtraccion || (mensaje && mensaje.length > 20))) {
-      const esTimeout = resultado && resultado.timeout;
-      const esAmbiguedadFecha = resultado && resultado.requiereConfirmacionFecha;
-
-      if (esAmbiguedadFecha) {
-        systemFinal += '\n\nADVERTENCIA INTERNA: El usuario intentó registrar algo de un día pasado pero la fecha no pudo resolverse con seguridad. No digas que quedó registrado. Pedile una aclaración breve: "¿Qué día fue exactamente?"';
-      } else if (esTimeout) {
-        systemFinal += '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado. Decile al usuario: "Recibí tu mensaje, tardé más de lo normal en procesarlo. No lo reenvíes todavía — si no aparece registrado, lo revisamos." Sin decir "anotado" ni "registrado".';
-      } else {
+    // Advertencias internas según resultado de extracción
+    if (!esMensajeSistema && cantidadGuardada === 0 && resultado) {
+      if (resultado.requiereConfirmacionFecha) {
+        systemFinal += '\n\nADVERTENCIA INTERNA: El usuario intentó registrar algo de un día pasado pero la fecha es ambigua. No digas que quedó registrado. Pedile una aclaración breve: "¿Qué día fue exactamente?"';
+      } else if (resultado.timeout) {
+        systemFinal += '\n\nADVERTENCIA INTERNA: La extracción tardó demasiado. Decile al usuario: "Recibí tu mensaje, tardé más de lo normal en procesarlo. Si no aparece registrado, lo revisamos." Sin decir "anotado" ni "registrado".';
+      } else if (resultado.error || (mensaje && mensaje.length > 20)) {
         systemFinal += '\n\nADVERTENCIA INTERNA: No se pudo guardar ningún registro estructurado. Si el usuario intentó registrar algo, no digas "anotado", "registrado" ni "lo sumo". Respondé naturalmente sin afirmar que quedó guardado.';
       }
     }
 
-    if (!enOnboarding && insightsFiltrados && insightsFiltrados.length > 0) {
-      systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural):\n';
+    if (insightsFiltrados.length > 0) {
+      systemFinal += '\n\nSEÑALES DETECTADAS (mencioná solo si es relevante y natural, máximo una por respuesta):\n';
       insightsFiltrados.slice(0, 3).forEach(i => {
-        // Incluir ID explícito para que el modelo pueda taggear cuál usó
         systemFinal += `- [id:${i.id}] ${i.tipo_insight}: ${i.regla_origen} (confianza: ${i.confianza})\n`;
       });
     }
 
-    if (!enOnboarding && contextoObraSocial) {
-      systemFinal += `\n\n${contextoObraSocial}`;
-    }
+    if (contextoObraSocial) systemFinal += `\n\n${contextoObraSocial}`;
 
-    if (!enOnboarding && eventosProximos && eventosProximos.length > 0) {
+    if (eventosProximos && eventosProximos.length > 0) {
       systemFinal += '\n\nEVENTOS PRÓXIMOS:\n';
       eventosProximos.forEach(e => {
         const fecha = new Date(e.fecha_evento).toLocaleDateString('es-AR');
@@ -1824,148 +1810,162 @@ async function procesarChat(usuario, mensaje, res, imagenes) {
         systemFinal += `- ${e.titulo}: ${fecha} (en ${diasRestantes} días) — ${e.descripcion}\n`;
       });
     }
-
-    if (!enOnboarding) {
-      // Regla única y no contradictoria — el estado del día es la única fuente de verdad
-      if (estadoDiaResult) {
-        if (estadoDiaResult.diaCerrado) {
-          systemFinal += '\n\nESTADO: El día está cerrado. Cerrá con algo breve y cálido. Sin preguntas.';
-        } else if (!estadoDiaResult.puedePreguntar) {
-          systemFinal += '\n\nESTADO: No hay próximo momento habilitado ahora. Respondé sin hacer preguntas sobre el día.';
-        } else if (estadoDiaResult.proximoMomento) {
-          systemFinal += `\n\nESTADO: Si vas a hacer una pregunta sobre el día, que sea sobre "${estadoDiaResult.proximoMomento}". Una sola.`;
-        }
-      }
-    }
-
-    const mensajesPrevios = (historial || [])
-      .reverse()
-      .filter(h => ['user', 'assistant'].includes(h.rol))
-      .map(h => ({ role: h.rol, content: h.mensaje }));
-
-    mensajesPrevios.push({ role: 'user', content: mensaje || '[imágenes]' });
-
-    if (!esMensajeSistema) {
-      await supabase.from('conversaciones').insert([{
-        usuario_id: user.id,
-        rol: 'user',
-        mensaje: tieneImagenes ? '[imagen' + (imagenes.length > 1 ? 'es' : '') + ']' + (mensaje ? ': ' + mensaje : '') : mensaje
-      }]);
-    }
-
-    let response;
-    if (imagenesValidas && imagenesValidas.length > 0) {
-      response = await generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenesValidas);
-    } else {
-      response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 500,
-        system: systemFinal,
-        messages: mensajesPrevios,
-      });
-    }
-
-    let respuestaRaw = response.content[0].text;
-
-    // Parsear tag [INSIGHT_ID: xxx] — acepta números y UUIDs
-    const insightTagMatch = respuestaRaw.match(/\[INSIGHT_ID:\s*([a-zA-Z0-9-]+)\]/i);
-    let respuesta = respuestaRaw.replace(/\[INSIGHT_ID:\s*[a-zA-Z0-9-]+\]\s*/gi, '').trimEnd();
-    const insightUsadoId = insightTagMatch ? insightTagMatch[1] : null;
-
-    // Sin guardrail — el modelo maneja la conversación con el contexto del estado del día.
-
-    await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
-
-    // Actualizar ultimo_mensaje_at y, si el modelo usó un insight, registrarlo
-    const updateEstadoPayload = { ultimo_mensaje_at: new Date().toISOString() };
-    if (insightUsadoId) {
-      updateEstadoPayload.ultimo_insight_mostrado_id = insightUsadoId;
-      updateEstadoPayload.ultimo_insight_mostrado_at = new Date().toISOString();
-      console.log(`Insight ${insightUsadoId} marcado como mostrado`);
-
-      // Marcar el insight como comunicado y subir contador solo cuando se usó realmente
-      try {
-        const { data: insightActual } = await supabase
-          .from('insights')
-          .select('contador_exposiciones')
-          .eq('id', insightUsadoId)
-          .single();
-        await supabase
-          .from('insights')
-          .update({
-            estado: 'comunicado',
-            comunicado_al_usuario: true,
-            fecha_comunicacion: new Date().toISOString(),
-            contador_exposiciones: ((insightActual?.contador_exposiciones || 0) + 1)
-          })
-          .eq('id', insightUsadoId);
-      } catch (e) {
-        console.error('Error actualizando insight comunicado:', e.message);
-      }
-    }
-    if (triggerCheckin) {
-      updateEstadoPayload.ultimo_checkin_ofrecido_at = new Date().toISOString();
-    }
-    await supabase.from('estado_usuario').update(updateEstadoPayload).eq('usuario_id', user.id);
-
-    // Procesar onboarding automático si el usuario todavía no completó
-    if (enOnboarding) {
-      const historialCompleto = await supabase
-        .from('conversaciones')
-        .select('rol, mensaje')
-        .eq('usuario_id', user.id)
-        .order('fecha', { ascending: true })
-        .limit(30);
-      await procesarOnboarding(user.id, estadoFinal, historialCompleto.data || [], respuesta);
-    }
-
-    const responsePayload = {
-      respuesta,
-      usuario: user.nombre,
-      onboarding: enOnboarding,
-      modo: estadoFinal.modo_usuario,
-      madurez: estadoFinal.madurez_sabi,
-      registros_guardados: cantidadGuardada,
-      insights_pendientes: insightsFiltrados ? insightsFiltrados.length : 0,
-      trigger_checkin: triggerCheckin || false
-    };
-
-    // Si trigger_checkin, incluir las preguntas para que el frontend las muestre
-    if (triggerCheckin) {
-      responsePayload.checkin = {
-        preguntas: [
-          { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'] },
-          { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'] },
-          { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'] },
-          { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'] },
-          { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'] },
-          { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], opcional: true }
-        ]
-      };
-    }
-
-    res.json(responsePayload);
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
   }
+
+  // 14. Armar historial para el modelo
+  const mensajesPrevios = (historial || [])
+    .reverse()
+    .filter(h => ['user', 'assistant'].includes(h.rol))
+    .map(h => ({ role: h.rol, content: h.mensaje }));
+
+  mensajesPrevios.push({ role: 'user', content: mensaje || '[imágenes]' });
+
+  // 15. Guardar mensaje del usuario en conversaciones
+  if (!esMensajeSistema) {
+    await supabase.from('conversaciones').insert([{
+      usuario_id: user.id,
+      rol: 'user',
+      mensaje: tieneImagenes ? '[imagen' + (imagenes.length > 1 ? 'es' : '') + ']' + (mensaje ? ': ' + mensaje : '') : mensaje
+    }]);
+  }
+
+  // 16. Llamada al modelo
+  let response;
+  if (imagenesValidas && imagenesValidas.length > 0) {
+    response = await generarRespuestaConImagenes(systemFinal, mensajesPrevios, mensaje, imagenesValidas);
+  } else {
+    response = await anthropic.messages.create({
+      model: MODELO,
+      max_tokens: 500,
+      system: systemFinal,
+      messages: mensajesPrevios,
+    });
+  }
+
+  let respuestaRaw = response.content[0].text;
+
+  // 17. Parsear tag de insight usado
+  const insightTagMatch = respuestaRaw.match(/\[INSIGHT_ID:\s*([a-zA-Z0-9-]+)\]/i);
+  let respuesta = respuestaRaw.replace(/\[INSIGHT_ID:\s*[a-zA-Z0-9-]+\]\s*/gi, '').trimEnd();
+  const insightUsadoId = insightTagMatch ? insightTagMatch[1] : null;
+
+  // 18. Guardar respuesta
+  await supabase.from('conversaciones').insert([{ usuario_id: user.id, rol: 'assistant', mensaje: respuesta }]);
+
+  // 19. Actualizar estado_usuario
+  const updateEstadoPayload = { ultimo_mensaje_at: new Date().toISOString() };
+  if (insightUsadoId) {
+    updateEstadoPayload.ultimo_insight_mostrado_id = insightUsadoId;
+    updateEstadoPayload.ultimo_insight_mostrado_at = new Date().toISOString();
+    console.log(`Insight ${insightUsadoId} marcado como mostrado`);
+
+    try {
+      const { data: insightActual } = await supabase
+        .from('insights')
+        .select('contador_exposiciones')
+        .eq('id', insightUsadoId)
+        .single();
+      await supabase
+        .from('insights')
+        .update({
+          estado: 'comunicado',
+          comunicado_al_usuario: true,
+          fecha_comunicacion: new Date().toISOString(),
+          contador_exposiciones: ((insightActual?.contador_exposiciones || 0) + 1)
+        })
+        .eq('id', insightUsadoId);
+    } catch (e) {
+      console.error('Error actualizando insight comunicado:', e.message);
+    }
+  }
+  if (triggerCheckin) updateEstadoPayload.ultimo_checkin_ofrecido_at = new Date().toISOString();
+  await supabase.from('estado_usuario').update(updateEstadoPayload).eq('usuario_id', user.id);
+
+  // 20. Onboarding automático
+  if (enOnboarding) {
+    const historialCompleto = await supabase
+      .from('conversaciones')
+      .select('rol, mensaje')
+      .eq('usuario_id', user.id)
+      .order('fecha', { ascending: true })
+      .limit(30);
+    await procesarOnboarding(user.id, estadoFinal, historialCompleto.data || []);
+  }
+
+  // 21. Marcar mensaje como procesado (idempotencia)
+  if (hashMensaje) {
+    await registrarMensajeProcesado(user.id, hashMensaje, mensaje, cantidadGuardada, 'procesado');
+  }
+
+  // 22. Devolver payload
+  const payload = {
+    respuesta,
+    usuario: user.nombre,
+    onboarding: enOnboarding,
+    modo: estadoFinal.modo_usuario,
+    madurez: estadoFinal.madurez_sabi,
+    registros_guardados: cantidadGuardada,
+    insights_pendientes: insightsFiltrados.length,
+    trigger_checkin: triggerCheckin || false
+  };
+
+  if (triggerCheckin) {
+    payload.checkin = { preguntas: PREGUNTAS_CHECKIN };
+  }
+
+  return payload;
 }
 
-// GET legacy — solo disponible fuera de producción
-if (process.env.NODE_ENV !== 'production') {
-  app.get('/chat/:usuario/:mensaje', async (req, res) => {
-    await procesarChat(req.params.usuario, req.params.mensaje, res, null);
-  });
-}
+// ─── PREGUNTAS DE CHECK-IN (compartidas entre /chat y /checkin) ──────────────
+
+const PREGUNTAS_CHECKIN = [
+  { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'] },
+  { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'] },
+  { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'] },
+  { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'] },
+  { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'] },
+  { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], opcional: true }
+];
+
+const MAPA_ENERGIA_CHECKIN = { 'Alta': 5, 'Normal': 3, 'Baja': 2, 'Muy baja': 1 };
+
+// ─── ENDPOINTS HTTP ──────────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+  res.json({ status: 'Sabi está vivo', version: '3.6.0' });
+});
 
 app.post('/chat', async (req, res) => {
   const { usuario, mensaje, imagenes } = req.body;
   if (!usuario || (!mensaje && (!imagenes || imagenes.length === 0))) {
     return res.status(400).json({ error: 'Faltan usuario y mensaje o imágenes' });
   }
-  await procesarChat(usuario, mensaje || '', res, imagenes ? imagenes.slice(0, 5) : null);
+  try {
+    const resultado = await generarRespuesta(
+      usuario,
+      mensaje || '',
+      imagenes ? imagenes.slice(0, 5) : null
+    );
+    res.json(resultado);
+  } catch (error) {
+    console.error('Error en /chat:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
+
+// GET legacy — solo en dev. En producción no se monta el endpoint.
+if (IS_DEV) {
+  app.get('/chat/:usuario/:mensaje', async (req, res) => {
+    try {
+      const resultado = await generarRespuesta(req.params.usuario, req.params.mensaje, null);
+      res.json(resultado);
+    } catch (error) {
+      console.error('Error en GET /chat legacy:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+  console.log('GET /chat/:usuario/:mensaje habilitado (NODE_ENV != production)');
+}
 
 app.post('/resumen', async (req, res) => {
   const { usuario } = req.body;
@@ -1981,7 +1981,7 @@ app.post('/resumen', async (req, res) => {
 
     res.json({ resumen, usuario: user.nombre });
   } catch (error) {
-    console.error(error);
+    console.error('Error en /resumen:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1992,28 +1992,12 @@ app.get('/checkin/:usuario', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json({
       mensaje: `¿Cómo terminó el día, ${user.nombre}?`,
-      preguntas: [
-        { id: 1, pregunta: '¿Cómo estuvo tu energía hoy?', opciones: ['Alta', 'Normal', 'Baja', 'Muy baja'] },
-        { id: 2, pregunta: '¿Cómo te sentiste por dentro?', opciones: ['Bien', 'Regular', 'Pesado', 'Ansioso'] },
-        { id: 3, pregunta: '¿Estuviste con gente que te hace bien?', opciones: ['Sí, estuvo bueno', 'Algo, poco', 'Solo todo el día'] },
-        { id: 4, pregunta: '¿Ya estás soltando el día?', opciones: ['Sí, desconectando', 'Más o menos', 'No, sigo en modo trabajo'] },
-        { id: 5, pregunta: '¿Cómo estuvo el cuerpo?', opciones: ['Liviano', 'Normal', 'Pesado o cansado', 'Algo molesto'] },
-        { id: 6, pregunta: '¿Algo del día que quieras dejar anotado?', opciones: ['Sí, te cuento', 'No, ya está'], opcional: true }
-      ]
+      preguntas: PREGUNTAS_CHECKIN
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
-
-
-// ─── POST /checkin ───────────────────────────────────────────────────────────
-// Recibe las respuestas del check-in de cierre y las guarda como registros
-// estructurados. No depende del extractor — los datos ya vienen limpios.
-
-const MAPA_ENERGIA_CHECKIN = {
-  'Alta': 5, 'Normal': 3, 'Baja': 2, 'Muy baja': 1
-};
 
 app.post('/checkin', async (req, res) => {
   const { usuario, respuestas } = req.body;
@@ -2065,9 +2049,10 @@ app.post('/checkin', async (req, res) => {
     }
 
     let guardados = 0;
-    for (const registro of registrosCheckin) {
-      const { error } = await supabase.from('registros').insert([registro]);
-      if (!error) guardados++;
+    if (registrosCheckin.length > 0) {
+      const { data, error } = await supabase.from('registros').insert(registrosCheckin).select('id');
+      if (!error && data) guardados = data.length;
+      else if (error) console.error('Error guardando checkin:', error.message);
     }
 
     const resumenTexto = respuestas
@@ -2079,7 +2064,6 @@ app.post('/checkin', async (req, res) => {
       mensaje: `[check-in cierre] ${resumenTexto}`
     }]);
 
-    // Actualizar ultimo_checkin_at en estado_usuario
     await supabase
       .from('estado_usuario')
       .update({ ultimo_checkin_at: new Date().toISOString() })
@@ -2092,5 +2076,11 @@ app.post('/checkin', async (req, res) => {
   }
 });
 
+// ─── ARRANQUE ────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Sabi escuchando en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Sabi v3.6.0 escuchando en puerto ${PORT}`);
+  console.log(`NODE_ENV: ${process.env.NODE_ENV || 'no-set (dev mode)'}`);
+  console.log(`CORS allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+});
